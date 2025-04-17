@@ -1,5 +1,9 @@
 # rdb: rust debugger
 
+Build project:
+
+`cargo build --release --target x86_64-unknown-linux-musl`
+
 To launch process:
 
 `./rdb "<PATH>"`then type "continue"
