@@ -1,5 +1,9 @@
 # rdb: rust debugger
 
+To launch process:
+
+`./rdb "<PATH>"`then type "continue"
+
 To attach to process:
 
 ```

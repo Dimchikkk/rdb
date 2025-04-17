@@ -1,8 +1,10 @@
+use std::ffi::CString;
+
 use anyhow::{bail, Result};
 use copperline::Copperline;
 use nix::sys::wait::waitpid;
-use nix::sys::ptrace::{attach, cont};
-use nix::unistd::Pid;
+use nix::sys::ptrace::{attach, cont, traceme};
+use nix::unistd::{execv, fork, ForkResult, Pid};
 
 fn main() -> Result<()> {
     let mut args = std::env::args();
@@ -16,11 +18,12 @@ fn main() -> Result<()> {
         let pid_num = pid_str.parse::<i32>().expect("PID should be a number");
         let pid = Pid::from_raw(pid_num);
         let mut process = Process { pid, status: None };
-        process.attach().unwrap();
-        main_loop(&mut process).unwrap();
+        process.attach()?;
+        main_loop(&mut process)?;
     } else {
         let program_path = args.nth(1).unwrap();
-        bail!("Launching program is not implemented yet!: {}", program_path);
+        let mut process = Process::launch(program_path)?;
+        main_loop(&mut process)?;
     }
     Ok(())
 }
@@ -30,7 +33,7 @@ fn main_loop(process: &mut Process) -> Result<()> {
     while let Ok(line) = cl.read_line("rdb> ", copperline::Encoding::Utf8) {
         if !line.is_empty() {
             if line.starts_with("continue") {
-                process.resume().unwrap();
+                process.resume()?;
                 // TODO: implement printing stop reason
             }
         }
@@ -59,8 +62,8 @@ impl Process {
             bail!("Invalid PID");
         }
 
-        attach(pid).unwrap();
-        waitpid(pid, None).unwrap();
+        attach(pid)?;
+        waitpid(pid, None)?;
 
         self.status = Some(Pstatus::Stopped);
 
@@ -70,12 +73,30 @@ impl Process {
 
     pub fn resume(&mut self) -> Result<()> {
         let pid = self.pid;
-        cont(self.pid, None).unwrap();
+        cont(self.pid, None)?;
 
         self.status = Some(Pstatus::Running);
-        waitpid(pid, None).unwrap();
+        waitpid(pid, None)?;
 
         println!("Resumed process: {}", self.pid);
         Ok(())
+    }
+
+    fn launch(program_path: String) -> Result<Self> {
+        match unsafe{fork()} {
+            Ok(ForkResult::Parent { child, .. }) => {
+                waitpid(child, None)?;
+                println!("Launched {}: {}", program_path, child);
+                Ok(Process { pid: child, status: Some(Pstatus::Running) })
+            }
+            Ok(ForkResult::Child) => {
+                let c_path = CString::new(program_path.as_bytes()).unwrap();
+                traceme()?;
+                execv(&c_path, &[c_path.clone()])?;
+
+                unreachable!();
+            }
+            Err(_) => bail!("Fork failed"),
+        }
     }
 }
