@@ -1,16 +1,14 @@
-use std::ffi::CString;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
-use nix::fcntl::OFlag;
-use std::os::unix::io::{AsRawFd, RawFd};
+use process::{print_stop_reason, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::sys::ptrace::{attach, cont, detach, traceme};
-use nix::unistd::{execv, fork, ForkResult, pipe2, Pid};
-use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
+use registers::{register_info_by_name, RegisterType, UserRegisters, REGISTERS};
+use registers_io::{format_register_value, parse_register_value};
 
+mod process;
+mod breakpoints;
+mod registers;
+mod registers_io;
 
 fn main() -> Result<()> {
     let mut args = std::env::args();
@@ -23,7 +21,14 @@ fn main() -> Result<()> {
         let pid_str = args.nth(0).unwrap();
         let pid_num = pid_str.parse::<i32>().expect("PID should be a number");
         let pid = Pid::from_raw(pid_num);
-        let mut process = Process { pid, status: None, terminate_on_end: false };
+        let user_registers = UserRegisters::new();
+        let mut process = Process {
+            pid,
+            status: None,
+            terminate_on_end: false,
+            is_attached: true,
+            registers: user_registers
+        };
         process.attach()?;
         main_loop(&mut process)?;
     } else {
@@ -38,10 +43,15 @@ fn main_loop(process: &mut Process) -> Result<()> {
     let mut cl = Copperline::new();
     while let Ok(line) = cl.read_line("rdb> ", copperline::Encoding::Utf8) {
         if !line.is_empty() {
-            if line.starts_with("continue") {
+            let args: Vec<&str> = line.split_whitespace().collect();
+            if line.starts_with("c") {
                 process.resume()?;
                 let reason = process.wait_on_signal()?;
                 print_stop_reason(process, reason);
+            } else if line.starts_with("reg") {
+                handle_register_command(process, &args);
+            } else if line.starts_with("h") {
+                print_help(&args);
             }
         }
         cl.add_history(line);
@@ -50,143 +60,85 @@ fn main_loop(process: &mut Process) -> Result<()> {
     Ok(())
 }
 
-fn print_stop_reason(process: &mut Process, reason: StopReason) {
-    println!("Process {} ", process.pid.to_string());
+fn handle_register_command(process: &mut Process, args: &[&str]) {
+    if args.len() < 2 {
+        print_help(&["help", "register"]);
+        return;
+    }
 
-    match reason.reason {
-        Pstatus::Stopped => println!("stopped with signal {}", reason.signal),
-        Pstatus::Running => panic!("unreachable print_stop_reason"),
-        Pstatus::Terminated => println!("terminated with signal: {}", reason.signal),
-        Pstatus::Exited => println!("exited with status {}", reason.status),
+    if args[1].starts_with("read") {
+        handle_register_read(process, args);
+    } else if args[1].starts_with("write") {
+        handle_register_write(process, args);
+    } else {
+        print_help(&["help", "register"]);
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum Pstatus {
-    Stopped,
-    Running,
-    Terminated,
-    Exited
-}
+pub fn handle_register_read(process: &Process, args: &[&str]) {
+    if args.len() == 2 || (args.len() == 3 && args[2] == "all") {
+        for info in REGISTERS.iter() {
+            let should_print = (args.len() == 3 || info.register_type == RegisterType::Gpr)
+                && info.name.to_lowercase() != "orig_rax";
 
-struct StopReason {
-    reason: Pstatus,
-    status: u8,
-    signal: String,
-}
+            if !should_print {
+                continue;
+            }
 
-pub struct Process {
-    pid: Pid,
-    status: Option<Pstatus>,
-    terminate_on_end: bool,
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        if self.pid.as_raw() != 0 {
-            if self.terminate_on_end {
-                let _ = kill(self.pid, Signal::SIGKILL);
-                let _ = waitpid(self.pid, None);
-            } else {
-                if self.status == Some(Pstatus::Running) {
-                    let _ = kill(self.pid, Signal::SIGSTOP);
-                    let _ = waitpid(self.pid, None);
-                }
-                let _ = detach(self.pid, None);
-                let _ = kill(self.pid, Signal::SIGCONT);
+            let value = process.registers.read(info);
+            let formatted = format_register_value(&value);
+            println!("{}:\t{}", info.name, formatted);
+        }
+    } else if args.len() == 3 {
+        let reg_name = args[2];
+        match register_info_by_name(reg_name) {
+            info => {
+                let value = process.registers.read(info);
+                let formatted = format_register_value(&value);
+                println!("{}:\t{}", info.name, formatted);
             }
         }
+    } else {
+         print_help(&["help", "register"]);
     }
 }
 
-impl Process {
-    pub fn attach(&mut self) -> Result<()> {
-        let pid = self.pid;
-        if pid.as_raw() == 0 {
-            bail!("Invalid PID");
+fn handle_register_write(process: &mut Process, args: &[&str]) {
+    if args.len() != 4 {
+        print_help(&["help", "register"]);
+        return;
+    }
+
+    let reg_name = args[2];
+    let info = register_info_by_name(reg_name);
+    let parse_result = parse_register_value(info, args[3]);
+    let value = match parse_result {
+        Ok(v) => v,
+        Err(err_msg) => {
+            eprintln!("{}", err_msg);
+            return;
         }
+    };
 
-        attach(pid)?;
-        self.wait_on_signal()?;
-
-        println!("Attached to {}", pid);
-        Ok(())
-    }
-
-    pub fn resume(&mut self) -> Result<()> {
-        cont(self.pid, None)?;
-
-        self.status = Some(Pstatus::Running);
-
-        println!("Resumed process: {}", self.pid);
-        Ok(())
-    }
-
-    fn launch(program_path: String) -> Result<Self> {
-        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC)?;
-
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child, .. }) => {
-                nix::unistd::close(write_fd.as_raw_fd())?;
-
-                let mut file = unsafe { File::from_raw_fd(read_fd.as_raw_fd()) };
-                let mut error_message = String::new();
-                file.read_to_string(&mut error_message)?;
-
-                if !error_message.is_empty() {
-                    waitpid(child, None)?;
-                    bail!("Error from child: {}", error_message);
-                }
-
-                waitpid(child, None)?;
-                println!("Launched child process for {}: {}", program_path, child);
-                Ok(Process { pid: child, status: Some(Pstatus::Running), terminate_on_end: true })
-            }
-            Ok(ForkResult::Child) => {
-                nix::unistd::close(read_fd.as_raw_fd())?;
-
-                traceme()?;
-
-                let c_path = CString::new(program_path.as_bytes())?;
-                if execv(&c_path, &[c_path.clone()]).is_err() {
-                    let error_message = "Exec failed".to_string();
-                    write_to_pipe(write_fd.as_raw_fd(), &error_message);
-                    std::process::exit(1);
-                }
-
-                unreachable!();
-            }
-            Err(_) => bail!("Fork failed"),
-        }
-    }
-
-    fn wait_on_signal(&mut self) -> Result<StopReason>{
-        match waitpid(self.pid, None) {
-            Ok(wait_status) => {
-                match wait_status {
-                    WaitStatus::Exited(_pid, status) => {
-                        self.status = Some(Pstatus::Exited);
-                        Ok(StopReason { reason: Pstatus::Exited, status: status as u8, signal: "".to_string() })
-                    },
-                    WaitStatus::Signaled(_pid, signal, _) => {
-                        self.status = Some(Pstatus::Terminated);
-                        Ok(StopReason { reason: Pstatus::Terminated, status: 0, signal: signal.to_string() })
-                    },
-                    WaitStatus::Stopped(_pid, signal) => {
-                        self.status = Some(Pstatus::Stopped);
-                        Ok(StopReason { reason: Pstatus::Stopped, status: 0, signal: signal.to_string() })
-                    },
-                    _ => bail!("Process is not stopped: {}", self.pid),
-                }
-            },
-            Err(e) => bail!("waitpid failed {}", e),
-        }
-    }
+    process.write_register(info, value);
 }
 
-fn write_to_pipe(write_fd: RawFd, message: &str) {
-    let mut file = unsafe { File::from_raw_fd(write_fd) };
-    if let Err(e) = file.write_all(message.as_bytes()) {
-        eprintln!("Failed to write error message to pipe: {}", e);
+fn print_help(args: &[&str]) {
+    match args {
+        ["help"] => {
+            println!("Available commands:");
+            println!("    continue    - Resume the process");
+            println!("    register    - Commands for operating on registers");
+        }
+        ["help", "register"] => {
+            println!("Available register commands:");
+            println!("    read");
+            println!("    read <register>");
+            println!("    read all");
+            println!("    write <register> <value>");
+        }
+        _ => {
+            println!("No help available on that");
+        }
     }
 }
