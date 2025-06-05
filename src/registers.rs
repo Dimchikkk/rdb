@@ -1,9 +1,6 @@
 use nix::libc::{user_regs_struct, user_fpregs_struct};
 use std::mem::{offset_of, zeroed};
 
-
-use crate::Process;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterType {
     Gpr,
@@ -40,6 +37,7 @@ pub enum RegisterId {
     // Floating Point
     FCW, FSW, FTW, FOP, FRIP, FRDP, MXCSR, MXCSRMASK,
     ST0, ST1, ST2, ST3, ST4, ST5, ST6, ST7,
+    MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
     XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
     XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15,
 
@@ -209,6 +207,40 @@ macro_rules! define_fp_st {
             offset: fpr_offset!(st_space) + ($n * 16),
             register_type: RegisterType::Fpr,
             format: RegisterFormat::LongDouble,
+        }
+    };
+}
+
+macro_rules! define_fp_mm {
+    ($n:expr) => {
+        RegisterInfo {
+            id: match $n {
+                0 => RegisterId::MM0,
+                1 => RegisterId::MM1,
+                2 => RegisterId::MM2,
+                3 => RegisterId::MM3,
+                4 => RegisterId::MM4,
+                5 => RegisterId::MM5,
+                6 => RegisterId::MM6,
+                7 => RegisterId::MM7,
+                _ => panic!("Invalid MM register number"),
+            },
+            name: match $n {
+                0 => "mm0",
+                1 => "mm1",
+                2 => "mm2",
+                3 => "mm3",
+                4 => "mm4",
+                5 => "mm5",
+                6 => "mm6",
+                7 => "mm7",
+                _ => panic!("Invalid MM register number"),
+            },
+            dwarf_id: 41 + $n,
+            size: 8,
+            offset: fpr_offset!(st_space) + ($n * 16),
+            register_type: RegisterType::Fpr,
+            format: RegisterFormat::Vector,
         }
     };
 }
@@ -404,6 +436,16 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_fp_st!(6),
     define_fp_st!(7),
 
+    // MM Registers
+    define_fp_mm!(0),
+    define_fp_mm!(1),
+    define_fp_mm!(2),
+    define_fp_mm!(3),
+    define_fp_mm!(4),
+    define_fp_mm!(5),
+    define_fp_mm!(6),
+    define_fp_mm!(7),
+
     // XMM Registers
     define_fp_xmm!(0),
     define_fp_xmm!(1),
@@ -470,69 +512,16 @@ pub enum RegisterValue {
     Bytes128([u8; 16]),
 }
 
-pub trait FromRegisterValue {
-    fn from_register_value(val: RegisterValue) -> Option<Self> where Self: Sized;
-}
-
-pub trait IntoRegisterValue {
-    fn into_register_value(self) -> RegisterValue;
-}
-
-macro_rules! impl_register_value_conversion {
-    ($ty:ty, $variant:ident) => {
-        impl FromRegisterValue for $ty {
-            fn from_register_value(val: RegisterValue) -> Option<Self> {
-                match val {
-                    RegisterValue::$variant(v) => Some(v as $ty),
-                    _ => None,
-                }
-            }
+impl RegisterValue {
+    fn byte_size(&self) -> usize {
+        match self {
+            RegisterValue::U8(_) | RegisterValue::I8(_) => 1,
+            RegisterValue::U16(_) | RegisterValue::I16(_) => 2,
+            RegisterValue::U32(_) | RegisterValue::I32(_) | RegisterValue::F32(_) => 4,
+            RegisterValue::U64(_) | RegisterValue::I64(_) | RegisterValue::F64(_)
+            | RegisterValue::Bytes64(_) => 8,
+            RegisterValue::Bytes128(_) => 16,
         }
-
-        impl IntoRegisterValue for $ty {
-            fn into_register_value(self) -> RegisterValue {
-                RegisterValue::$variant(self as _)
-            }
-        }
-    };
-}
-
-impl_register_value_conversion!(u8, U8);
-impl_register_value_conversion!(u16, U16);
-impl_register_value_conversion!(i16, I16);
-impl_register_value_conversion!(u32, U32);
-impl_register_value_conversion!(i32, I32);
-impl_register_value_conversion!(i64, I64);
-impl_register_value_conversion!(f32, F32);
-impl_register_value_conversion!(f64, F64);
-
-impl FromRegisterValue for [u8; 8] {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::Bytes64(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for [u8; 16] {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::Bytes128(v) => Some(v),
-            _ => None,
-        }
-    }
-}
-
-impl IntoRegisterValue for [u8; 8] {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::Bytes64(self)
-    }
-}
-
-impl IntoRegisterValue for [u8; 16] {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::Bytes128(self)
     }
 }
 
@@ -573,7 +562,7 @@ impl UserRegisters {
                 }
                 (8, _) => RegisterValue::I64(ptr.cast::<i64>().read()),
                 (16, RegisterFormat::LongDouble) => {
-                    // read 16 bytes for an 80-bit “long double” slot
+                    // read 16 bytes for an 80-bit "long double" slot
                     let mut bytes = [0u8; 16];
                     ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 16);
                     RegisterValue::Bytes128(bytes)
@@ -584,6 +573,51 @@ impl UserRegisters {
                     RegisterValue::Bytes128(bytes)
                 }
                 (size, format) => panic!("Unsupported register (size, format): ({} , {:?})", size, format),
+            }
+        }
+    }
+
+    pub fn write_raw(&mut self, info: &RegisterInfo, val: RegisterValue) {
+        let base_ptr: *mut u8 = match info.register_type {
+            RegisterType::Gpr | RegisterType::SubGpr => {
+                &mut self.regs as *mut _ as *mut u8
+            }
+            RegisterType::Fpr => {
+                &mut self.fp_regs as *mut _ as *mut u8
+            }
+            RegisterType::Dr => {
+                self.debug_regs.as_mut_ptr() as *mut u8
+            }
+        };
+
+        unsafe {
+            let ptr = base_ptr.add(info.offset);
+
+            match (val, info.size) {
+                (RegisterValue::U8(v), 1) => ptr.write(v),
+                (RegisterValue::I8(v), 1) => ptr.cast::<i8>().write(v),
+                (RegisterValue::U16(v), 2) => ptr.cast::<u16>().write(v),
+                (RegisterValue::I16(v), 2) => ptr.cast::<i16>().write(v),
+                (RegisterValue::U32(v), 4) => ptr.cast::<u32>().write(v),
+                (RegisterValue::I32(v), 4) => ptr.cast::<i32>().write(v),
+                (RegisterValue::F32(v), 4) => ptr.cast::<f32>().write(v),
+                (RegisterValue::U64(v), 8) => ptr.cast::<u64>().write(v),
+                (RegisterValue::I64(v), 8) => ptr.cast::<i64>().write(v),
+                (RegisterValue::F64(v), 8) => ptr.cast::<f64>().write(v),
+                (RegisterValue::Bytes64(bytes), 8) => {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, 8);
+                }
+
+                (RegisterValue::Bytes128(bytes), 16) => {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, 16);
+                }
+
+                (val, size) => panic!(
+                    "Type/size mismatch in write_raw: value = {:?} ({} bytes), info.size = {}",
+                    val,
+                    val.byte_size(),
+                    size
+                ),
             }
         }
     }

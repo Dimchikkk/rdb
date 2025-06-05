@@ -2,12 +2,13 @@ use process::{print_stop_reason, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
 use nix::unistd::Pid;
-use registers::{register_info_by_name, RegisterType, RegisterValue, UserRegisters, REGISTERS};
-use std::fmt::Write;
+use registers::{register_info_by_name, RegisterType, UserRegisters, REGISTERS};
+use registers_io::{format_register_value, parse_register_value};
 
 mod process;
 mod breakpoints;
 mod registers;
+mod registers_io;
 
 fn main() -> Result<()> {
     let mut args = std::env::args();
@@ -43,13 +44,13 @@ fn main_loop(process: &mut Process) -> Result<()> {
     while let Ok(line) = cl.read_line("rdb> ", copperline::Encoding::Utf8) {
         if !line.is_empty() {
             let args: Vec<&str> = line.split_whitespace().collect();
-            if line.starts_with("continue") {
+            if line.starts_with("c") {
                 process.resume()?;
                 let reason = process.wait_on_signal()?;
                 print_stop_reason(process, reason);
-            } else if line.starts_with("register") {
+            } else if line.starts_with("reg") {
                 handle_register_command(process, &args);
-            } else if line.starts_with("help") {
+            } else if line.starts_with("h") {
                 print_help(&args);
             }
         }
@@ -71,39 +72,6 @@ fn handle_register_command(process: &mut Process, args: &[&str]) {
         handle_register_write(process, args);
     } else {
         print_help(&["help", "register"]);
-    }
-}
-
-fn format_register_value(value: &RegisterValue) -> String {
-    match value {
-        RegisterValue::F32(f) => format!("{}", f),
-        RegisterValue::F64(f) => format!("{}", f),
-        RegisterValue::U8(v) => format!("0x{:02x}", v),
-        RegisterValue::U16(v) => format!("0x{:04x}", v),
-        RegisterValue::U32(v) => format!("0x{:08x}", v),
-        RegisterValue::U64(v) => format!("0x{:016x}", v),
-        RegisterValue::I8(v) => format!("0x{:02x}", v),
-        RegisterValue::I16(v) => format!("0x{:04x}", v),
-        RegisterValue::I32(v) => format!("0x{:08x}", v),
-        RegisterValue::I64(v) => format!("0x{:016x}", v),
-        RegisterValue::Bytes64(bytes) => {
-            let mut s = String::from("[");
-            for (i, b) in bytes.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
-                write!(s, "0x{:02x}", b).unwrap();
-            }
-            s.push(']');
-            s
-        }
-        RegisterValue::Bytes128(bytes) => {
-            let mut s = String::from("[");
-            for (i, b) in bytes.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
-                write!(s, "0x{:02x}", b).unwrap();
-            }
-            s.push(']');
-            s
-        }
     }
 }
 
@@ -136,7 +104,23 @@ pub fn handle_register_read(process: &Process, args: &[&str]) {
 }
 
 fn handle_register_write(process: &mut Process, args: &[&str]) {
-    todo!()
+    if args.len() != 4 {
+        print_help(&["help", "register"]);
+        return;
+    }
+
+    let reg_name = args[2];
+    let info = register_info_by_name(reg_name);
+    let parse_result = parse_register_value(info, args[3]);
+    let value = match parse_result {
+        Ok(v) => v,
+        Err(err_msg) => {
+            eprintln!("{}", err_msg);
+            return;
+        }
+    };
+
+    process.write_register(info, value);
 }
 
 fn print_help(args: &[&str]) {

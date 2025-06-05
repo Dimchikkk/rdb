@@ -1,2 +1,4 @@
 /target
 /test_programs/hello_world
+/test_programs/reg_read.o
+/test_programs/reg_read

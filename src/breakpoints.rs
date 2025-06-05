@@ -1,6 +1,5 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
-use crate::Process;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtAddr(u64);

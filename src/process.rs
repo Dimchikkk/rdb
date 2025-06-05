@@ -1,19 +1,20 @@
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use nix::fcntl::OFlag;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use anyhow::{bail, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::sys::ptrace::{attach, cont, detach, getregs, setregs, traceme, write_user };
 use nix::unistd::{execv, fork, ForkResult, pipe2, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, user_fpregs_struct, user_regs_struct, PTRACE_GETFPREGS, PTRACE_PEEKUSER};
-use libc::{ptrace, PTRACE_SETFPREGS, pid_t, c_void};
+use nix::libc::{self, c_long, user_fpregs_struct, user_regs_struct, PTRACE_GETFPREGS, PTRACE_PEEKUSER, PTRACE_SETFPREGS};
+use libc::{ptrace, c_void};
 use std::ptr;
+use std::io::Error;
 
-use crate::registers::{register_info_by_id, UserRegisters, DEBUG_REG_IDS};
+use crate::registers::{register_info_by_id, RegisterInfo, RegisterType, RegisterValue, UserRegisters, DEBUG_REG_IDS};
 
 #[derive(PartialEq, Eq)]
 pub enum Pstatus {
@@ -153,7 +154,7 @@ impl Process {
                     _ => bail!("Process is not stopped: {}", self.pid),
                 };
                 if self.is_attached == true && self.status == Some(Pstatus::Stopped) {
-                    self.read_all_registers();
+                    self.read_all_registers()?;
                 }
                 reason
             },
@@ -223,11 +224,12 @@ impl Process {
             let ret = ptrace(
                 PTRACE_SETFPREGS,
                 self.pid.as_raw(),
-                fprs as *const _ as *mut c_void,
                 ptr::null_mut::<c_void>(),
+                fprs as *const _ as *mut c_void,
             );
             if ret != 0 {
-                bail!("Could not write floating point registers");
+                let err = Error::last_os_error();
+                bail!("Could not write floating point registers: {}", err);
             }
         }
         Ok(())
@@ -238,6 +240,30 @@ impl Process {
             bail!("Could not write general purpose registers");
         }
         Ok(())
+    }
+
+    pub fn write_register(&mut self, info: &RegisterInfo, val: RegisterValue) {
+        self.registers.write_raw(info, val);
+
+        if info.register_type == RegisterType::Fpr {
+            self.write_fprs(&self.registers.fp_regs)
+                .unwrap_or_else(|e| panic!("Failed to write FPR registers: {}", e));
+        } else {
+            // align offset down to 8 bytes and write that word
+            let aligned_offset = info.offset & !0b111;
+            let aligned_value = unsafe {
+                let aligned_ptr = (&self.registers.regs as *const _ as *const u8)
+                    .add(aligned_offset);
+                aligned_ptr.cast::<u64>().read()
+            };
+            self.write_user_area(aligned_offset, aligned_value)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to write GPR/debug at offset {}: {}",
+                        aligned_offset, e
+                    )
+                });
+        }
     }
 }
 
