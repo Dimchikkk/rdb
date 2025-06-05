@@ -33,14 +33,13 @@ impl SubAssign<i64> for VirtAddr {
     }
 }
 
-pub struct BreakpointSite<'a> {
+pub struct BreakpointSite {
     id: i32,
-    process: &'a Process,
     address: VirtAddr,
     is_enabled: bool,
     saved_data: u8,
 }
 
-impl<'a> BreakpointSite<'a> {
+impl BreakpointSite {
     // implement enable / disable / at_address / in_range
 }

@@ -46,6 +46,16 @@ pub enum RegisterId {
     // Debug Registers
     DR0, DR1, DR2, DR3, DR4, DR5, DR6, DR7,
 }
+pub const DEBUG_REG_IDS: [RegisterId; 8] = [
+    RegisterId::DR0,
+    RegisterId::DR1,
+    RegisterId::DR2,
+    RegisterId::DR3,
+    RegisterId::DR4,
+    RegisterId::DR5,
+    RegisterId::DR6,
+    RegisterId::DR7,
+];
 
 #[repr(C)]
 pub struct UserRegisters {
@@ -423,7 +433,7 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_dr!(7),
 ];
 
-pub fn register_by<F>(f: F) -> &'static RegisterInfo
+pub fn register_info_by<F>(f: F) -> &'static RegisterInfo
 where
     F: FnMut(&&RegisterInfo) -> bool
 {
@@ -432,21 +442,16 @@ where
         .unwrap_or_else(|| panic!("Can't find register info"))
 }
 
-pub fn register_by_id(id: RegisterId) -> &'static RegisterInfo {
-    register_by(|reg| reg.id == id)
+pub fn register_info_by_id(id: RegisterId) -> &'static RegisterInfo {
+    register_info_by(|reg| reg.id == id)
 }
 
-pub fn register_by_name(name: &str) -> &'static RegisterInfo {
-    register_by(|reg| reg.name == name)
+pub fn register_info_by_name(name: &str) -> &'static RegisterInfo {
+    register_info_by(|reg| reg.name.to_lowercase() == name.to_lowercase())
 }
 
-pub fn register_by_dwarf(dwarf_id: i32) -> &'static RegisterInfo {
-    register_by(|reg| reg.dwarf_id == dwarf_id)
-}
-
-pub struct Registers<'a> {
-    data: UserRegisters,
-    process: &'a Process,  // Direct reference to process
+pub fn register_info_by_dwarf(dwarf_id: i32) -> &'static RegisterInfo {
+    register_info_by(|reg| reg.dwarf_id == dwarf_id)
 }
 
 #[derive(Debug)]
@@ -465,93 +470,6 @@ pub enum RegisterValue {
     Bytes128([u8; 16]),
 }
 
-
-impl<'a> Registers<'a> {
-    pub(crate) fn new(process: &'a Process) -> Self {
-        Registers {
-            data: unsafe { zeroed() }, // Safe initialization through zeroed
-            process,
-        }
-    }
-
-    pub fn read(&self, info: &RegisterInfo) -> RegisterValue {
-        unsafe {
-            let ptr = (&self.data as *const UserRegisters as *const u8).add(info.offset);
-            match (info.size, info.format.clone()) {
-                (1, RegisterFormat::Uint) => RegisterValue::U8(ptr.read()),
-                (2, RegisterFormat::Uint) => RegisterValue::U16(ptr.cast::<u16>().read()),
-                (4, RegisterFormat::Uint) => RegisterValue::U32(ptr.cast::<u32>().read()),
-                (8, RegisterFormat::Uint) => RegisterValue::U64(ptr.cast::<u64>().read()),
-                (1, _) => RegisterValue::I8(ptr.cast::<i8>().read()),
-                (2, _) => RegisterValue::I16(ptr.cast::<i16>().read()),
-                (4, RegisterFormat::Float) => RegisterValue::F32(ptr.cast::<f32>().read()),
-                (4, _) => RegisterValue::I32(ptr.cast::<i32>().read()),
-                (8, RegisterFormat::Double) => RegisterValue::F64(ptr.cast::<f64>().read()),
-                (8, RegisterFormat::Vector) => {
-                    let mut bytes = [0u8; 8];
-                    ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 8);
-                    RegisterValue::Bytes64(bytes)
-                },
-                (8, _) => RegisterValue::I64(ptr.cast::<i64>().read()),
-                (16, RegisterFormat::Vector) => {
-                    let mut bytes = [0u8; 16];
-                    ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 16);
-                    RegisterValue::Bytes128(bytes)
-                },
-                _ => panic!("Unsupported register format/size"),
-            }
-        }
-    }
-
-    pub fn write(&mut self, info: &RegisterInfo, val: RegisterValue) {
-        unsafe {
-            let ptr = (&mut self.data as *mut UserRegisters as *mut u8).add(info.offset);
-            match (val, info.size, info.format.clone()) {
-                (RegisterValue::U8(v), 1, _) => ptr.write(v),
-                (RegisterValue::U16(v), 2, _) => ptr.cast::<u16>().write(v),
-                (RegisterValue::U32(v), 4, _) => ptr.cast::<u32>().write(v),
-                (RegisterValue::U64(v), 8, _) => ptr.cast::<u64>().write(v),
-                (RegisterValue::I8(v), 1, _) => ptr.cast::<i8>().write(v),
-                (RegisterValue::I16(v), 2, _) => ptr.cast::<i16>().write(v),
-                (RegisterValue::I32(v), 4, _) => ptr.cast::<i32>().write(v),
-                (RegisterValue::I64(v), 8, _) => ptr.cast::<i64>().write(v),
-                (RegisterValue::F32(v), 4, _) => ptr.cast::<f32>().write(v),
-                (RegisterValue::F64(v), 8, _) => ptr.cast::<f64>().write(v),
-                (RegisterValue::Bytes64(bytes), 8, _) => {
-                    ptr.copy_from_nonoverlapping(bytes.as_ptr(), 8)
-                },
-                (RegisterValue::Bytes128(bytes), 16, _) => {
-                    ptr.copy_from_nonoverlapping(bytes.as_ptr(), 16)
-                },
-                _ => panic!("Type/size mismatch"),
-            }
-        }
-
-        if info.register_type == RegisterType::Fpr {
-            self.process.write_fprs(&self.data.fp_regs);
-        } else {
-            let aligned_offset = info.offset & !0b111;
-            let aligned_value = unsafe {
-                let ptr = (&self.data as *const UserRegisters as *const u8).add(aligned_offset);
-                ptr.cast::<u64>().read()
-            };
-            self.process.write_user_area(aligned_offset, aligned_value);
-        }
-    }
-
-    pub fn read_by_id_as<T: FromRegisterValue>(&self, id: RegisterId) -> T {
-        let info = register_by_id(id);
-        let val = self.read(info);
-        T::from_register_value(val)
-            .unwrap_or_else(|| panic!("Invalid type conversion for register {}", info.name))
-    }
-
-    pub fn write_by_id(&mut self, id: RegisterId, val: impl IntoRegisterValue) {
-        let info = register_by_id(id);
-        self.write(info, val.into_register_value());
-    }
-}
-
 pub trait FromRegisterValue {
     fn from_register_value(val: RegisterValue) -> Option<Self> where Self: Sized;
 }
@@ -560,116 +478,33 @@ pub trait IntoRegisterValue {
     fn into_register_value(self) -> RegisterValue;
 }
 
-// Implement FromRegisterValue for all supported types
-impl FromRegisterValue for u8 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::U8(v) => Some(v),
-            RegisterValue::I8(v) => Some(v as u8),
-            _ => None,
+macro_rules! impl_register_value_conversion {
+    ($ty:ty, $variant:ident) => {
+        impl FromRegisterValue for $ty {
+            fn from_register_value(val: RegisterValue) -> Option<Self> {
+                match val {
+                    RegisterValue::$variant(v) => Some(v as $ty),
+                    _ => None,
+                }
+            }
         }
-    }
+
+        impl IntoRegisterValue for $ty {
+            fn into_register_value(self) -> RegisterValue {
+                RegisterValue::$variant(self as _)
+            }
+        }
+    };
 }
 
-impl FromRegisterValue for u16 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::U16(v) => Some(v),
-            RegisterValue::I16(v) => Some(v as u16),
-            RegisterValue::U8(v) => Some(v as u16),
-            RegisterValue::I8(v) => Some(v as u16),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for u32 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::U32(v) => Some(v),
-            RegisterValue::I32(v) => Some(v as u32),
-            RegisterValue::U16(v) => Some(v as u32),
-            RegisterValue::I16(v) => Some(v as u32),
-            RegisterValue::U8(v) => Some(v as u32),
-            RegisterValue::I8(v) => Some(v as u32),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for i8 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::I8(v) => Some(v),
-            RegisterValue::U8(v) => Some(v as i8),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for i16 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::I16(v) => Some(v),
-            RegisterValue::U16(v) => Some(v as i16),
-            RegisterValue::I8(v) => Some(v as i16),
-            RegisterValue::U8(v) => Some(v as i16),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for i32 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::I32(v) => Some(v),
-            RegisterValue::U32(v) => Some(v as i32),
-            RegisterValue::I16(v) => Some(v as i32),
-            RegisterValue::U16(v) => Some(v as i32),
-            RegisterValue::I8(v) => Some(v as i32),
-            RegisterValue::U8(v) => Some(v as i32),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for i64 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::I64(v) => Some(v),
-            RegisterValue::U64(v) => Some(v as i64),
-            RegisterValue::I32(v) => Some(v as i64),
-            RegisterValue::U32(v) => Some(v as i64),
-            RegisterValue::I16(v) => Some(v as i64),
-            RegisterValue::U16(v) => Some(v as i64),
-            RegisterValue::I8(v) => Some(v as i64),
-            RegisterValue::U8(v) => Some(v as i64),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for f32 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::F32(v) => Some(v),
-            RegisterValue::U32(v) => Some(f32::from_bits(v)),
-            RegisterValue::I32(v) => Some(v as f32),
-            _ => None,
-        }
-    }
-}
-
-impl FromRegisterValue for f64 {
-    fn from_register_value(val: RegisterValue) -> Option<Self> {
-        match val {
-            RegisterValue::F64(v) => Some(v),
-            RegisterValue::U64(v) => Some(f64::from_bits(v)),
-            RegisterValue::I64(v) => Some(v as f64),
-            _ => None,
-        }
-    }
-}
+impl_register_value_conversion!(u8, U8);
+impl_register_value_conversion!(u16, U16);
+impl_register_value_conversion!(i16, I16);
+impl_register_value_conversion!(u32, U32);
+impl_register_value_conversion!(i32, I32);
+impl_register_value_conversion!(i64, I64);
+impl_register_value_conversion!(f32, F32);
+impl_register_value_conversion!(f64, F64);
 
 impl FromRegisterValue for [u8; 8] {
     fn from_register_value(val: RegisterValue) -> Option<Self> {
@@ -689,67 +524,6 @@ impl FromRegisterValue for [u8; 16] {
     }
 }
 
-// Implement IntoRegisterValue for all supported types
-impl IntoRegisterValue for u8 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::U8(self)
-    }
-}
-
-impl IntoRegisterValue for u16 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::U16(self)
-    }
-}
-
-impl IntoRegisterValue for u32 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::U32(self)
-    }
-}
-
-impl IntoRegisterValue for u64 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::U64(self)
-    }
-}
-
-impl IntoRegisterValue for i8 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::I8(self)
-    }
-}
-
-impl IntoRegisterValue for i16 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::I16(self)
-    }
-}
-
-impl IntoRegisterValue for i32 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::I32(self)
-    }
-}
-
-impl IntoRegisterValue for i64 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::I64(self)
-    }
-}
-
-impl IntoRegisterValue for f32 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::F32(self)
-    }
-}
-
-impl IntoRegisterValue for f64 {
-    fn into_register_value(self) -> RegisterValue {
-        RegisterValue::F64(self)
-    }
-}
-
 impl IntoRegisterValue for [u8; 8] {
     fn into_register_value(self) -> RegisterValue {
         RegisterValue::Bytes64(self)
@@ -759,5 +533,58 @@ impl IntoRegisterValue for [u8; 8] {
 impl IntoRegisterValue for [u8; 16] {
     fn into_register_value(self) -> RegisterValue {
         RegisterValue::Bytes128(self)
+    }
+}
+
+impl UserRegisters {
+    pub fn new() -> Self {
+        unsafe {
+            UserRegisters {
+                regs: zeroed(),
+                fp_regs: zeroed(),
+                debug_regs: zeroed(),
+            }
+        }
+    }
+
+    pub fn read(&self, info: &RegisterInfo) -> RegisterValue {
+        let base_ptr = match info.register_type {
+            RegisterType::Gpr | RegisterType::SubGpr => &self.regs as *const _ as *const u8,
+            RegisterType::Fpr => &self.fp_regs as *const _ as *const u8,
+            RegisterType::Dr => &self.debug_regs as *const _ as *const u8,
+        };
+
+        unsafe {
+            let ptr = base_ptr.add(info.offset);
+            match (info.size, info.format.clone()) {
+                (1, RegisterFormat::Uint) => RegisterValue::U8(ptr.read()),
+                (2, RegisterFormat::Uint) => RegisterValue::U16(ptr.cast::<u16>().read()),
+                (4, RegisterFormat::Uint) => RegisterValue::U32(ptr.cast::<u32>().read()),
+                (8, RegisterFormat::Uint) => RegisterValue::U64(ptr.cast::<u64>().read()),
+                (1, _) => RegisterValue::I8(ptr.cast::<i8>().read()),
+                (2, _) => RegisterValue::I16(ptr.cast::<i16>().read()),
+                (4, RegisterFormat::Float) => RegisterValue::F32(ptr.cast::<f32>().read()),
+                (4, _) => RegisterValue::I32(ptr.cast::<i32>().read()),
+                (8, RegisterFormat::Double) => RegisterValue::F64(ptr.cast::<f64>().read()),
+                (8, RegisterFormat::Vector) => {
+                    let mut bytes = [0u8; 8];
+                    ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 8);
+                    RegisterValue::Bytes64(bytes)
+                }
+                (8, _) => RegisterValue::I64(ptr.cast::<i64>().read()),
+                (16, RegisterFormat::LongDouble) => {
+                    // read 16 bytes for an 80-bit “long double” slot
+                    let mut bytes = [0u8; 16];
+                    ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 16);
+                    RegisterValue::Bytes128(bytes)
+                }
+                (16, RegisterFormat::Vector) => {
+                    let mut bytes = [0u8; 16];
+                    ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 16);
+                    RegisterValue::Bytes128(bytes)
+                }
+                (size, format) => panic!("Unsupported register (size, format): ({} , {:?})", size, format),
+            }
+        }
     }
 }

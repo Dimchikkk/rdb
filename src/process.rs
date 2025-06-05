@@ -6,10 +6,14 @@ use nix::fcntl::OFlag;
 use std::os::unix::io::{AsRawFd, RawFd};
 use anyhow::{bail, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::sys::ptrace::{attach, cont, detach, traceme, write_user, setregs };
+use nix::sys::ptrace::{attach, cont, detach, getregs, setregs, traceme, write_user };
 use nix::unistd::{execv, fork, ForkResult, pipe2, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, user_fpregs_struct, user_regs_struct};
+use nix::libc::{self, c_long, user_fpregs_struct, user_regs_struct, PTRACE_GETFPREGS, PTRACE_PEEKUSER};
+use libc::{ptrace, PTRACE_SETFPREGS, pid_t, c_void};
+use std::ptr;
+
+use crate::registers::{register_info_by_id, UserRegisters, DEBUG_REG_IDS};
 
 #[derive(PartialEq, Eq)]
 pub enum Pstatus {
@@ -30,6 +34,7 @@ pub struct Process {
     pub status: Option<Pstatus>,
     pub terminate_on_end: bool,
     pub is_attached: bool,
+    pub registers: UserRegisters
 }
 
 pub fn print_stop_reason(process: &mut Process, reason: StopReason) {
@@ -106,7 +111,8 @@ impl Process {
 
                 waitpid(child, None)?;
                 println!("Launched child process for {}: {}", program_path, child);
-                Ok(Process { pid: child, status: Some(Pstatus::Running), terminate_on_end: true, is_attached: false })
+                let user_registers = UserRegisters::new();
+                Ok(Process { pid: child, status: Some(Pstatus::Running), terminate_on_end: true, is_attached: false, registers: user_registers })
             }
         Ok(ForkResult::Child) => {
                 let read_raw_fd = read_fd.into_raw_fd();
@@ -147,12 +153,62 @@ impl Process {
                     _ => bail!("Process is not stopped: {}", self.pid),
                 };
                 if self.is_attached == true && self.status == Some(Pstatus::Stopped) {
-                    // read_all_registers();
+                    self.read_all_registers();
                 }
                 reason
             },
             Err(e) => bail!("waitpid failed {}", e),
         }
+    }
+
+    pub fn read_all_registers(&mut self) -> Result<()> {
+        match getregs(self.pid) {
+            Ok(r) => {
+                self.registers.regs = r;
+            }
+            Err(e) => bail!("Could not read GPR registers: {}", e),
+        }
+
+        let ret = unsafe {
+            ptrace(
+                PTRACE_GETFPREGS,
+                self.pid.as_raw() as i32,
+                ptr::null_mut::<c_void>(),
+                &mut self.registers.fp_regs as *mut _ as *mut c_void,
+            )
+        };
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            bail!("Could not read FPR registers: {}", err);
+        }
+
+        for (i, reg_id) in DEBUG_REG_IDS.iter().enumerate() {
+            let info = register_info_by_id(reg_id.clone());
+
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+
+            let data: c_long = unsafe {
+                ptrace(
+                    PTRACE_PEEKUSER,
+                    self.pid.as_raw() as i32,
+                    info.offset,
+                    ptr::null_mut::<c_void>(),
+                )
+            };
+
+            // clear errno before the call
+            let err_no = unsafe { *libc::__errno_location() };
+            if data == -1 && err_no != 0 {
+                let err = std::io::Error::from_raw_os_error(err_no);
+                bail!("Could not read debug register {}: {}", info.name, err);
+            }
+
+            self.registers.debug_regs[i] = data as u64;
+        }
+
+        Ok(())
     }
 
     pub fn write_user_area(&self, offset: usize, data: u64) -> Result<()> {
@@ -163,10 +219,17 @@ impl Process {
     }
 
     pub fn write_fprs(&self, fprs: &user_fpregs_struct) -> Result<()> {
-//       TODO: call ptrace from libc directly since no setfregs on nix crate
-//       if setfpregs(self.pid, fprs).is_err() {
-//            bail!("Could not write floating point registers");
-//       }
+        unsafe {
+            let ret = ptrace(
+                PTRACE_SETFPREGS,
+                self.pid.as_raw(),
+                fprs as *const _ as *mut c_void,
+                ptr::null_mut::<c_void>(),
+            );
+            if ret != 0 {
+                bail!("Could not write floating point registers");
+            }
+        }
         Ok(())
     }
 
