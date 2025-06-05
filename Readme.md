@@ -1,12 +1,9 @@
 # rdb: rust debugger
 
-Build project:
-
-`cargo build --release --target x86_64-unknown-linux-musl`
-
 To launch process:
 
-`./rdb "<PATH>"`then type "continue"
+`gcc -o ./test_programs/hello_world ./test_programs/hello_world.c`
+`cargo run -- "./test_programs/hello_world"`
 
 To attach to process:
 
@@ -15,6 +12,6 @@ $ while sleep 7; do echo "test"; done &
 [1] 1247
 
 // from another terminal
-$ tools/sdb -p 1247
+$ cargo run -- -p 1247
 ```
-it will attach to the process and stop it, then type "continue" to continue running process until it halts again. May need to type "continue" couple of times to see "test" output
+it will attach to the process and stop it, then type "continue" to continue running process until it halts again by `sleep` sys call.
