@@ -4,7 +4,7 @@ use copperline::Copperline;
 use nix::unistd::Pid;
 use registers::{register_info_by_name, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
-use stoppoint::StoppointCollection;
+use stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
 
 mod process;
 mod breakpoints;
@@ -55,8 +55,8 @@ fn main_loop(process: &mut Process) -> Result<()> {
                 print_stop_reason(process, reason);
             } else if command.starts_with("reg") {
                 handle_register_command(process, &args);
-            } else if command.starts_with("break") {
-                handle_breakpoint_command(process, &args);
+            } else if command.starts_with("b") {
+                handle_breakpoint_command(process, &args)?;
             } else if command.starts_with("s") {
                 let reason = process.step_instruction()?;
                 print_stop_reason(process, reason);
@@ -73,8 +73,70 @@ fn main_loop(process: &mut Process) -> Result<()> {
     Ok(())
 }
 
-fn handle_breakpoint_command(process: &mut Process, args: &[&str]) {
-    todo!()
+fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()> {
+    let command = args[1];
+
+    if command.starts_with("list") {
+        if process.breakpoint_sites.stoppoints.is_empty() {
+            println!("No breakpoints set");
+        } else {
+            println!("Current breakpoints:");
+            for site in &process.breakpoint_sites.stoppoints {
+                println!(
+                    "{}: address = {:#x}, {}",
+                    site.id,
+                    site.address.0,
+                    if site.is_enabled { "enabled" } else { "disabled" }
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if command.starts_with("set") {
+        let addr_str = args[2];
+        let addr_trimmed = addr_str.strip_prefix("0x").unwrap_or(addr_str);
+
+        let address = match u64::from_str_radix(addr_trimmed, 16) {
+            Ok(addr) => addr,
+            Err(_) => {
+                eprintln!("Breakpoint command expects address in hexadecimal, prefixed with '0x'");
+                return Ok(());
+            }
+        };
+
+        let pid = process.pid.clone();
+        process.create_breakpoint_site(VirtAddr(address)).enable(pid)?;
+        return Ok(());
+    }
+
+    let id = match args[2].parse::<i32>() {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!("Command expects breakpoint id");
+            return Ok(());
+        }
+    };
+
+    if command.starts_with("enable") {
+        if let Some(site) = process.breakpoint_sites.get_by_id_mut(id) {
+            site.enable(process.pid)?;
+        } else {
+            eprintln!("No breakpoint with id {}", id);
+        }
+    } else if command.starts_with("disable") {
+        if let Some(site) = process.breakpoint_sites.get_by_id_mut(id) {
+            site.disable(process.pid)?;
+        } else {
+            eprintln!("No breakpoint with id {}", id);
+        }
+    } else if command.starts_with("delete") {
+        process.breakpoint_sites.remove_by_id(process.pid, id)?;
+    } else {
+        print_help(&["help", "breakpoint"]);
+    }
+
+    Ok(())
 }
 
 fn handle_register_command(process: &mut Process, args: &[&str]) {

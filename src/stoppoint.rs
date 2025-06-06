@@ -1,4 +1,7 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign};
+use anyhow::Result;
+
+use nix::unistd::Pid;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtAddr(pub u64);
@@ -36,8 +39,8 @@ pub trait Stoppoint {
 
     fn id(&self) -> Self::Id;
     fn is_enabled(&self) -> bool;
-    fn enable(&mut self);
-    fn disable(&mut self);
+    fn enable(&mut self, pid: Pid) -> Result<()>;
+    fn disable(&mut self, pid: Pid) -> Result<()>;
 
     fn at_address(&self, addr: VirtAddr) -> bool;
     fn in_range(&self, low: VirtAddr, high: VirtAddr) -> bool;
@@ -68,25 +71,27 @@ impl<T: Stoppoint> StoppointCollection<T> {
             .any(|sp| sp.at_address(addr) && sp.is_enabled())
     }
 
-    pub fn get_by_id(&self, id: T::Id) -> Option<&T> {
-        self.stoppoints.iter().find(|sp| sp.id() == id)
+    pub fn get_by_id_mut(&mut self, id: T::Id) -> Option<&mut T> {
+        self.stoppoints.iter_mut().find(|sp| sp.id() == id)
     }
 
     pub fn get_by_address_mut(&mut self, addr: VirtAddr) -> Option<&mut T> {
         self.stoppoints.iter_mut().find(|sp| sp.at_address(addr))
     }
 
-    pub fn remove_by_id(&mut self, id: T::Id) {
+    pub fn remove_by_id(&mut self, pid: Pid, id: T::Id) -> Result<()> {
         if let Some(pos) = self.stoppoints.iter().position(|sp| sp.id() == id) {
-            self.stoppoints[pos].disable();
+            self.stoppoints[pos].disable(pid)?;
             self.stoppoints.remove(pos);
         }
+        Ok(())
     }
 
-    pub fn remove_by_address(&mut self, addr: VirtAddr) {
+    pub fn remove_by_address(&mut self, pid: Pid, addr: VirtAddr) -> Result<()>{
         if let Some(pos) = self.stoppoints.iter().position(|sp| sp.at_address(addr)) {
-            self.stoppoints[pos].disable();
+            self.stoppoints[pos].disable(pid)?;
             self.stoppoints.remove(pos);
         }
+        Ok(())
     }
 }
