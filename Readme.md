@@ -1,6 +1,6 @@
 # rdb: rust debugger
 
-Supports only `x86_64`, based on https://github.com/TartanLlama/sdb.
+Supports only `linux x86_64`, based on https://github.com/TartanLlama/sdb.
 
 To launch process:
 

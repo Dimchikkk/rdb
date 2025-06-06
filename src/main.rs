@@ -4,9 +4,11 @@ use copperline::Copperline;
 use nix::unistd::Pid;
 use registers::{register_info_by_name, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
+use stoppoint::StoppointCollection;
 
 mod process;
 mod breakpoints;
+mod stoppoint;
 mod registers;
 mod registers_io;
 
@@ -27,7 +29,8 @@ fn main() -> Result<()> {
             status: None,
             terminate_on_end: false,
             is_attached: true,
-            registers: user_registers
+            registers: user_registers,
+            breakpoint_sites: StoppointCollection::new(),
         };
         process.attach()?;
         main_loop(&mut process)?;
@@ -42,22 +45,36 @@ fn main() -> Result<()> {
 fn main_loop(process: &mut Process) -> Result<()> {
     let mut cl = Copperline::new();
     while let Ok(line) = cl.read_line("rdb> ", copperline::Encoding::Utf8) {
-        if !line.is_empty() {
+        if !line.trim().is_empty() {
             let args: Vec<&str> = line.split_whitespace().collect();
-            if line.starts_with("c") {
+            let command = args[0];
+
+            if command.starts_with("c") {
                 process.resume()?;
                 let reason = process.wait_on_signal()?;
                 print_stop_reason(process, reason);
-            } else if line.starts_with("reg") {
+            } else if command.starts_with("reg") {
                 handle_register_command(process, &args);
-            } else if line.starts_with("h") {
+            } else if command.starts_with("break") {
+                handle_breakpoint_command(process, &args);
+            } else if command.starts_with("s") {
+                let reason = process.step_instruction()?;
+                print_stop_reason(process, reason);
+            } else if command.starts_with("help") {
                 print_help(&args);
+            } else {
+                println!("Unknown command");
             }
+
+            cl.add_history(line);
         }
-        cl.add_history(line);
     }
 
     Ok(())
+}
+
+fn handle_breakpoint_command(process: &mut Process, args: &[&str]) {
+    todo!()
 }
 
 fn handle_register_command(process: &mut Process, args: &[&str]) {
@@ -127,10 +144,20 @@ fn print_help(args: &[&str]) {
     match args {
         ["help"] => {
             println!("Available commands:");
+            println!("    breakpoint  - Commands for operating on breakpoints");
             println!("    continue    - Resume the process");
             println!("    register    - Commands for operating on registers");
+            println!("    step        - Step over a single instruction");
         }
-        ["help", "register"] => {
+        ["help", cmd] if cmd.starts_with("breakpoint") => {
+            println!("Available breakpoint commands:");
+            println!("    list");
+            println!("    delete <id>");
+            println!("    disable <id>");
+            println!("    enable <id>");
+            println!("    set <address>");
+        }
+        ["help", cmd] if cmd.starts_with("register") => {
             println!("Available register commands:");
             println!("    read");
             println!("    read <register>");

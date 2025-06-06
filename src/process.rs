@@ -4,9 +4,9 @@ use std::io::Read;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use nix::fcntl::OFlag;
 use std::os::unix::io::RawFd;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::sys::ptrace::{attach, cont, detach, getregs, setregs, traceme, write_user };
+use nix::sys::ptrace::{attach, cont, detach, getregs, setregs, step, traceme, write_user };
 use nix::unistd::{execv, fork, ForkResult, pipe2, Pid};
 use nix::sys::signal::{kill, Signal};
 use nix::libc::{self, c_long, user_fpregs_struct, user_regs_struct, PTRACE_GETFPREGS, PTRACE_PEEKUSER, PTRACE_SETFPREGS};
@@ -14,7 +14,9 @@ use libc::{ptrace, c_void};
 use std::ptr;
 use std::io::Error;
 
-use crate::registers::{register_info_by_id, RegisterInfo, RegisterType, RegisterValue, UserRegisters, DEBUG_REG_IDS};
+use crate::breakpoints::BreakpointSite;
+use crate::registers::{register_info_by_id, RegisterId, RegisterInfo, RegisterType, RegisterValue, UserRegisters, DEBUG_REG_IDS};
+use crate::stoppoint::{StoppointCollection, VirtAddr};
 
 #[derive(PartialEq, Eq)]
 pub enum Pstatus {
@@ -35,7 +37,8 @@ pub struct Process {
     pub status: Option<Pstatus>,
     pub terminate_on_end: bool,
     pub is_attached: bool,
-    pub registers: UserRegisters
+    pub registers: UserRegisters,
+    pub breakpoint_sites: StoppointCollection<BreakpointSite>,
 }
 
 pub fn print_stop_reason(process: &mut Process, reason: StopReason) {
@@ -113,7 +116,14 @@ impl Process {
                 waitpid(child, None)?;
                 println!("Launched child process for {}: {}", program_path, child);
                 let user_registers = UserRegisters::new();
-                Ok(Process { pid: child, status: Some(Pstatus::Running), terminate_on_end: true, is_attached: false, registers: user_registers })
+                Ok(Process {
+                    pid: child,
+                    status: Some(Pstatus::Running),
+                    terminate_on_end: true,
+                    is_attached: false,
+                    registers: user_registers,
+                    breakpoint_sites: StoppointCollection::new(),
+                })
             }
         Ok(ForkResult::Child) => {
                 let read_raw_fd = read_fd.into_raw_fd();
@@ -135,7 +145,7 @@ impl Process {
         }
     }
 
-    pub fn wait_on_signal(&mut self) -> Result<StopReason>{
+    pub fn wait_on_signal(&mut self) -> Result<StopReason> {
         match waitpid(self.pid, None) {
             Ok(wait_status) => {
                 let reason = match wait_status {
@@ -264,6 +274,45 @@ impl Process {
                     )
                 });
         }
+    }
+
+    pub fn step_instruction(&mut self) -> Result<StopReason> {
+        let mut to_reenable: Option<*mut BreakpointSite> = None;
+        let pc = self.get_pc()?;
+        println!("Stepping at PC = 0x{:x}", pc.0);
+
+        {
+            if self.breakpoint_sites.enabled_stoppoint_at_address(pc) {
+                if let Some(bp) = self.breakpoint_sites.get_by_address_mut(pc) {
+                    bp.disable();
+                    // Store raw pointer so we can re-enable later
+                    to_reenable = Some(bp as *mut _);
+                }
+            }
+        }
+
+        step(self.pid, None).with_context(|| "Could not single step")?;
+
+        let reason = self.wait_on_signal()?;
+
+        if let Some(bp_ptr) = to_reenable {
+            unsafe {
+                // SAFETY: we only use the pointer after the original borrow ends
+                (*bp_ptr).enable();
+            }
+        }
+
+        Ok(reason)
+    }
+
+    pub fn get_pc(&self) -> Result<VirtAddr> {
+        let info = register_info_by_id(RegisterId::RIP);
+        let value = self.registers.read(info);
+        let pc: u64 = match value {
+            RegisterValue::U64(v) => v,
+            _ => panic!("Expected RegisterValue::U64 but got {:?}", value),
+        };
+        Ok(VirtAddr(pc))
     }
 }
 

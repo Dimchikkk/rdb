@@ -18,6 +18,7 @@ pub enum RegisterFormat {
     Vector,
 }
 
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RegisterId {
     // General Purpose Registers

@@ -1,36 +1,4 @@
-use std::ops::{Add, AddAssign, Sub, SubAssign};
-
-
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub struct VirtAddr(u64);
-
-impl Add<i64> for VirtAddr  {
-    type Output = Self;
-
-    fn add(self, offset: i64) -> Self {
-        VirtAddr((self.0 as i64 + offset) as u64)
-    }
-}
-
-impl Sub<i64> for VirtAddr  {
-    type Output = Self;
-
-    fn sub(self, offset: i64) -> Self {
-        VirtAddr((self.0 as i64 - offset) as u64)
-    }
-}
-
-impl AddAssign<i64> for VirtAddr {
-    fn add_assign(&mut self, offset: i64) {
-        self.0 = (self.0 as i64 + offset) as u64;
-    }
-}
-
-impl SubAssign<i64> for VirtAddr {
-    fn sub_assign(&mut self, offset: i64) {
-        self.0 = (self.0 as i64 - offset) as u64;
-    }
-}
+use crate::stoppoint::{Stoppoint, VirtAddr};
 
 pub struct BreakpointSite {
     id: i32,
@@ -39,6 +7,42 @@ pub struct BreakpointSite {
     saved_data: u8,
 }
 
+impl Stoppoint for BreakpointSite {
+    type Id = i32;
+
+    fn id(&self) -> Self::Id {
+        self.id
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.is_enabled
+    }
+
+    fn at_address(&self, addr: VirtAddr) -> bool {
+        self.address == addr
+    }
+
+    fn in_range(&self, low: VirtAddr, high: VirtAddr) -> bool {
+        self.address >= low && self.address <= high
+    }
+
+    fn enable(&mut self) {
+        self.enable();
+    }
+
+    fn disable(&mut self) {
+        self.disable();
+    }
+}
+
 impl BreakpointSite {
-    // implement enable / disable / at_address / in_range
+    pub fn enable(&mut self) {
+        self.is_enabled = true;
+        // TODO: implement enable
+    }
+
+    pub fn disable(&mut self) {
+        self.is_enabled = false;
+        // TODO: implement disable
+    }
 }
