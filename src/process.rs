@@ -11,14 +11,15 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::sys::ptrace::{attach, cont, detach, getregs, setregs, step, traceme, write_user };
 use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, c_ulong, personality, user_fpregs_struct, user_regs_struct, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER, PTRACE_SETFPREGS};
+use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, user_fpregs_struct, user_regs_struct, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER, PTRACE_SETFPREGS};
 use libc::{ptrace, c_void};
-use std::ptr;
+use std::{mem, ptr};
 use std::io::Error;
 
 use crate::breakpoints::BreakpointSite;
 use crate::registers::{register_info_by_id, RegisterId, RegisterInfo, RegisterType, RegisterValue, UserRegisters, DEBUG_REG_IDS};
 use crate::stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
+use crate::utils::FromBytes;
 
 #[derive(PartialEq, Eq)]
 pub enum Pstatus {
@@ -44,7 +45,9 @@ pub struct Process {
 }
 
 pub fn print_stop_reason(process: &mut Process, reason: StopReason) {
-    println!("Process {} ", process.pid.to_string());
+    let rip = process.get_pc().unwrap().0;
+
+    println!("Process {} stopped at address 0x{:x}", process.pid, rip);
 
     match reason.reason {
         Pstatus::Stopped => println!("stopped with signal {}", reason.signal),
@@ -387,6 +390,112 @@ impl Process {
         self.breakpoint_sites.stoppoints.push(new_site);
 
         self.breakpoint_sites.stoppoints.last_mut().unwrap()
+    }
+
+    pub fn read_memory(&self, address: VirtAddr, mut amount: usize) -> Result<Vec<u8>> {
+        let mut ret = vec![0u8; amount];
+        let local_iov = iovec {
+            iov_base: ret.as_mut_ptr() as *mut libc::c_void,
+            iov_len: ret.len(),
+        };
+
+        let mut remote_iovs = Vec::new();
+        let mut current_addr = address;
+
+        while amount > 0 {
+            let offset = current_addr.0 & 0xfff;
+            let up_to_next_page = (0x1000 - offset) as usize;
+            let chunk_size = amount.min(up_to_next_page);
+            remote_iovs.push(libc::iovec {
+                iov_base: current_addr.0 as *mut libc::c_void,
+                iov_len: chunk_size,
+            });
+
+            amount -= chunk_size;
+            current_addr = current_addr + (chunk_size as i64); // Or implement `.add()`
+        }
+
+        let result = unsafe {
+            process_vm_readv(
+                self.pid.as_raw(),
+                &local_iov as *const libc::iovec,
+                1,
+                remote_iovs.as_ptr(),
+                remote_iovs.len().try_into().unwrap(),
+                0,
+            )
+        };
+
+        if result < 0 {
+            return Err(anyhow::anyhow!("Could not read process memory (pid {})", self.pid)
+                       .context(std::io::Error::last_os_error()));
+        }
+
+        Ok(ret)
+    }
+
+    pub fn from_bytes<T: Copy>(bytes: &[u8]) -> Result<T> {
+        if bytes.len() != mem::size_of::<T>() {
+            return Err(anyhow::anyhow!(
+                "Expected {} bytes, got {}",
+                mem::size_of::<T>(),
+                bytes.len()
+            ));
+        }
+        let mut value = mem::MaybeUninit::<T>::uninit();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                value.as_mut_ptr() as *mut u8,
+                mem::size_of::<T>(),
+            );
+            Ok(value.assume_init())
+        }
+    }
+
+    pub fn read_memory_as<T: FromBytes>(self, address: VirtAddr) -> Result<T> {
+        let data = self.read_memory(address, std::mem::size_of::<T>())?;
+        T::from_bytes(&data)
+    }
+
+    pub fn write_memory(&self, address: VirtAddr, data: &[u8]) -> Result<()> {
+        let mut written = 0;
+
+        while written < data.len() {
+            let remaining = data.len() - written;
+            let word: u64;
+
+            if remaining >= 8 {
+                // Copy 8 bytes directly into u64
+                word = u64::from_le_bytes(data[written..written + 8].try_into().unwrap());
+            } else {
+                // Need to read original memory and merge partial write
+                let read = self.read_memory(address + written.try_into().unwrap(), 8)?;
+                let mut word_buf = [0u8; 8];
+                word_buf[..remaining].copy_from_slice(&data[written..]);
+                word_buf[remaining..].copy_from_slice(&read[remaining..]);
+                word = u64::from_le_bytes(word_buf);
+            }
+
+            // Actually write the word with ptrace
+            let result = unsafe {
+                libc::ptrace(
+                    libc::PTRACE_POKEDATA,
+                    self.pid.as_raw(),
+                    (address + written.try_into().unwrap()).0 as *mut libc::c_void,
+                    word as *mut libc::c_void,
+                )
+            };
+
+            if result < 0 {
+                return Err(anyhow::anyhow!("Failed to write memory at {:?}", (address + written.try_into().unwrap()).0)
+                           .context(std::io::Error::last_os_error()));
+            }
+
+            written += 8;
+        }
+
+        Ok(())
     }
 }
 

@@ -5,7 +5,9 @@ use nix::unistd::Pid;
 use registers::{register_info_by_name, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
 use stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
+use utils::{parse_vector, print_hex_dump};
 
+mod utils;
 mod process;
 mod breakpoints;
 mod stoppoint;
@@ -60,6 +62,8 @@ fn main_loop(process: &mut Process) -> Result<()> {
             } else if command.starts_with("s") {
                 let reason = process.step_instruction()?;
                 print_stop_reason(process, reason);
+            } else if command.starts_with("mem") {
+                handle_memory_command(process, &args)?;
             } else if command.starts_with("help") {
                 print_help(&args);
             } else {
@@ -69,6 +73,76 @@ fn main_loop(process: &mut Process) -> Result<()> {
             cl.add_history(line);
         }
     }
+
+    Ok(())
+}
+
+fn handle_memory_command(process: &mut Process, args: &[&str]) -> Result<()> {
+    if args.len() < 3 {
+        print_help(&["help", "memory"]);
+        return Ok(());
+    }
+
+    match args[1] {
+        cmd if cmd.starts_with("read") => handle_memory_read_command(process, args),
+        cmd if cmd.starts_with("write") => handle_memory_write_command(process, args),
+        _ => {
+            print_help(&["help", "memory"]);
+            Ok(())
+        }
+    }
+}
+
+fn handle_memory_write_command(process: &mut Process, args: &[&str]) -> Result<()> {
+    if args.len() < 4 {
+        print_help(&["help", "memory"]);
+        return Ok(());
+    }
+
+    let addr_str = args[2].strip_prefix("0x").unwrap_or(args[2]);
+    let address = u64::from_str_radix(addr_str, 16)
+        .map_err(|_| anyhow::anyhow!("Invalid address format"))?;
+
+    // Join all the rest args (bytes) into one string to parse
+    let bytes_str = args[3..].join(" ");
+
+    let bytes = parse_vector(&bytes_str)?;
+
+    process.write_memory(VirtAddr(address), &bytes)?;
+
+    Ok(())
+}
+
+fn handle_memory_read_command(process: &Process, args: &[&str]) -> Result<()> {
+    let address_str = args[2];
+    let address = if let Some(addr_str) = address_str.strip_prefix("0x") {
+        u64::from_str_radix(addr_str, 16)
+    } else {
+        u64::from_str_radix(address_str, 16)
+    };
+
+    let address = match address {
+        Ok(addr) => addr,
+        Err(_) => {
+            eprintln!("Invalid address format");
+            return Ok(());
+        }
+    };
+
+    let n_bytes = if args.len() >= 4 {
+        match args[3].parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("Invalid number of bytes");
+                return Ok(());
+            }
+        }
+    } else {
+        32
+    };
+
+    let bytes = process.read_memory(VirtAddr(address), n_bytes)?;
+    print_hex_dump(address, &bytes);
 
     Ok(())
 }
