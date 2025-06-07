@@ -1,4 +1,4 @@
-use process::{print_stop_reason, Process};
+use process::{handle_stop, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
 use nix::unistd::Pid;
@@ -54,16 +54,18 @@ fn main_loop(process: &mut Process) -> Result<()> {
             if command.starts_with("c") {
                 process.resume()?;
                 let reason = process.wait_on_signal()?;
-                print_stop_reason(process, reason);
+                handle_stop(process, reason);
             } else if command.starts_with("reg") {
                 handle_register_command(process, &args);
             } else if command.starts_with("b") {
                 handle_breakpoint_command(process, &args)?;
             } else if command.starts_with("s") {
                 let reason = process.step_instruction()?;
-                print_stop_reason(process, reason);
+                handle_stop(process, reason);
             } else if command.starts_with("mem") {
                 handle_memory_command(process, &args)?;
+            } else if command.starts_with("dis") {
+                handle_disassemble_command(process, &args);
             } else if command.starts_with("help") {
                 print_help(&args);
             } else {
@@ -75,6 +77,42 @@ fn main_loop(process: &mut Process) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_disassemble_command(process: &Process, args: &[&str]) {
+    let mut address = process.get_pc().unwrap();
+    let mut n_instructions = 5;
+
+    let mut it = 1;
+    while it < args.len() {
+        match args[it] {
+            "-a" if it + 1 < args.len() => {
+                it += 1;
+                if let Ok(addr) = u64::from_str_radix(args[it], 16) {
+                    address = VirtAddr(addr);
+                } else {
+                    eprintln!("Invalid address format");
+                    return;
+                }
+            }
+            "-c" if it + 1 < args.len() => {
+                it += 1;
+                if let Ok(count) = args[it].parse::<usize>() {
+                    n_instructions = count;
+                } else {
+                    eprintln!("Invalid instruction count");
+                    return;
+                }
+            }
+            _ => {
+                println!("Usage: dis [-a hex_address] [-c count]");
+                return;
+            }
+        }
+        it += 1;
+    }
+
+    print_disassembly(process, address, n_instructions);
 }
 
 fn handle_memory_command(process: &mut Process, args: &[&str]) -> Result<()> {
@@ -276,12 +314,20 @@ fn handle_register_write(process: &mut Process, args: &[&str]) {
     process.write_register(info, value);
 }
 
+fn print_disassembly(process: &Process, address: VirtAddr, n_instructions: usize) {
+    let instructions = process.disassemble(n_instructions, Some(address));
+    for instr in instructions {
+        println!("{:#018x}: {}", instr.address.0, instr.text);
+    }
+}
+
 fn print_help(args: &[&str]) {
     match args {
         ["help"] => {
             println!("Available commands:");
             println!("    breakpoint  - Commands for operating on breakpoints");
             println!("    continue    - Resume the process");
+            println!("    disassemble - Disassemble instructions from memory");
             println!("    register    - Commands for operating on registers");
             println!("    step        - Step over a single instruction");
         }
@@ -299,6 +345,11 @@ fn print_help(args: &[&str]) {
             println!("    read <register>");
             println!("    read all");
             println!("    write <register> <value>");
+        }
+        ["help", cmd] if cmd.starts_with("disassemble") => {
+            println!("Available options:");
+            println!("    -c <number of instructions>");
+            println!("    -a <start address>");
         }
         _ => {
             println!("No help available on that");

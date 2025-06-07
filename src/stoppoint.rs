@@ -94,4 +94,11 @@ impl<T: Stoppoint> StoppointCollection<T> {
         }
         Ok(())
     }
+
+    pub fn get_in_region(&self, low: VirtAddr, high: VirtAddr) -> Vec<&T> {
+        self.stoppoints
+            .iter()
+            .filter(|site| site.in_range(low, high))
+            .collect()
+    }
 }

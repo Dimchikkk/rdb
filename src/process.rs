@@ -15,8 +15,10 @@ use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, use
 use libc::{ptrace, c_void};
 use std::{mem, ptr};
 use std::io::Error;
+use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
 use crate::breakpoints::BreakpointSite;
+use crate::print_disassembly;
 use crate::registers::{register_info_by_id, RegisterId, RegisterInfo, RegisterType, RegisterValue, UserRegisters, DEBUG_REG_IDS};
 use crate::stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
 use crate::utils::FromBytes;
@@ -44,7 +46,12 @@ pub struct Process {
     pub breakpoint_sites: StoppointCollection<BreakpointSite>,
 }
 
-pub fn print_stop_reason(process: &mut Process, reason: StopReason) {
+pub struct Instruction {
+    pub address: VirtAddr,
+    pub text: String,
+}
+
+pub fn handle_stop(process: &mut Process, reason: StopReason) {
     let rip = process.get_pc().unwrap().0;
 
     println!("Process {} stopped at address 0x{:x}", process.pid, rip);
@@ -54,6 +61,10 @@ pub fn print_stop_reason(process: &mut Process, reason: StopReason) {
         Pstatus::Running => panic!("unreachable print_stop_reason"),
         Pstatus::Terminated => println!("terminated with signal: {}", reason.signal),
         Pstatus::Exited => println!("exited with status {}", reason.status),
+    }
+
+    if reason.reason == Pstatus::Stopped {
+        print_disassembly(&process, VirtAddr(rip), 5);
     }
 }
 
@@ -434,6 +445,27 @@ impl Process {
         Ok(ret)
     }
 
+    pub fn read_memory_without_traps(
+        &self,
+        address: VirtAddr,
+        amount: usize,
+    ) -> Result<Vec<u8>> {
+        let mut memory = self.read_memory(address, amount)?;
+
+        // Get breakpoint sites in the memory region
+        let sites = self.breakpoint_sites.get_in_region(address, address + amount.try_into().unwrap());
+
+        for site in sites {
+            if !site.is_enabled() {
+                continue;
+            }
+            let offset = (site.address.0 - address.0) as usize;
+            memory[offset] = site.saved_data;
+        }
+
+        Ok(memory)
+    }
+
     pub fn from_bytes<T: Copy>(bytes: &[u8]) -> Result<T> {
         if bytes.len() != mem::size_of::<T>() {
             return Err(anyhow::anyhow!(
@@ -496,6 +528,36 @@ impl Process {
         }
 
         Ok(())
+    }
+
+    pub fn disassemble(&self, n_instructions: usize, address: Option<VirtAddr>) -> Vec<Instruction> {
+        let mut result = Vec::with_capacity(n_instructions);
+        let addr = address.unwrap_or_else(|| self.get_pc().unwrap());
+
+        let code = self.read_memory_without_traps(addr, n_instructions * 15).unwrap();
+        if code.is_empty() {
+            return result;
+        }
+
+        let mut decoder = Decoder::with_ip(64, &code, addr.0, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+
+        for _ in 0..n_instructions {
+            if !decoder.can_decode() {
+                break;
+            }
+
+            let instr = decoder.decode();
+            let mut text = String::new();
+            formatter.format(&instr, &mut text);
+
+            result.push(Instruction {
+                address: VirtAddr(instr.ip()),
+                text,
+            });
+        }
+
+        result
     }
 }
 
