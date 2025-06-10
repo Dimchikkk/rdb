@@ -1,7 +1,7 @@
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use anyhow::Result;
 
-use nix::unistd::Pid;
+use crate::registers::UserRegisters;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtAddr(pub u64);
@@ -34,13 +34,22 @@ impl SubAssign<i64> for VirtAddr {
     }
 }
 
+pub enum StoppointMode {
+    Write,
+    ReadWrite,
+    Execute,
+}
+
 pub trait Stoppoint {
     type Id: PartialEq + Copy;
 
     fn id(&self) -> Self::Id;
     fn is_enabled(&self) -> bool;
-    fn enable(&mut self, pid: Pid) -> Result<()>;
-    fn disable(&mut self, pid: Pid) -> Result<()>;
+    fn enable(&mut self, registers: &mut UserRegisters) -> Result<()>;
+    fn disable(&mut self, registers: &mut UserRegisters) -> Result<()>;
+
+    fn clear_hardware_stoppoint(&mut self, registers: &mut UserRegisters, index: usize);
+    fn set_hardware_stoppoint(&mut self, registers: &mut UserRegisters, address: VirtAddr, mode: StoppointMode, size: usize) -> i32;
 
     fn at_address(&self, addr: VirtAddr) -> bool;
     fn in_range(&self, low: VirtAddr, high: VirtAddr) -> bool;
@@ -79,17 +88,17 @@ impl<T: Stoppoint> StoppointCollection<T> {
         self.stoppoints.iter_mut().find(|sp| sp.at_address(addr))
     }
 
-    pub fn remove_by_id(&mut self, pid: Pid, id: T::Id) -> Result<()> {
+    pub fn remove_by_id(&mut self, registers: &mut UserRegisters, id: T::Id) -> Result<()> {
         if let Some(pos) = self.stoppoints.iter().position(|sp| sp.id() == id) {
-            self.stoppoints[pos].disable(pid)?;
+            self.stoppoints[pos].disable(registers)?;
             self.stoppoints.remove(pos);
         }
         Ok(())
     }
 
-    pub fn remove_by_address(&mut self, pid: Pid, addr: VirtAddr) -> Result<()>{
+    pub fn remove_by_address(&mut self, registers: &mut UserRegisters, addr: VirtAddr) -> Result<()>{
         if let Some(pos) = self.stoppoints.iter().position(|sp| sp.at_address(addr)) {
-            self.stoppoints[pos].disable(pid)?;
+            self.stoppoints[pos].disable(registers)?;
             self.stoppoints.remove(pos);
         }
         Ok(())

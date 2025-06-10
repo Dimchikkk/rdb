@@ -8,18 +8,17 @@ use nix::sys::signal::Signal::SIGTRAP;
 use std::os::unix::io::RawFd;
 use anyhow::{bail, Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::sys::ptrace::{attach, cont, detach, getregs, setregs, step, traceme, write_user };
+use nix::sys::ptrace::{attach, cont, detach, getregs, step, traceme };
 use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, user_fpregs_struct, user_regs_struct, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER, PTRACE_SETFPREGS};
+use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER};
 use libc::{ptrace, c_void};
 use std::{mem, ptr};
-use std::io::Error;
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
 use crate::breakpoints::BreakpointSite;
 use crate::print_disassembly;
-use crate::registers::{register_info_by_id, RegisterId, RegisterInfo, RegisterType, RegisterValue, UserRegisters, DEBUG_REG_IDS};
+use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
 use crate::stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
 use crate::utils::FromBytes;
 
@@ -68,7 +67,7 @@ pub fn handle_stop(process: &mut Process, reason: StopReason) {
     }
 }
 
-static NEXT_BREAKPOINT_ID: AtomicI32 = AtomicI32::new(0);
+static NEXT_BREAKPOINT_ID: AtomicI32 = AtomicI32::new(1);
 
 impl Drop for Process {
     fn drop(&mut self) {
@@ -106,26 +105,12 @@ impl Process {
 
     pub fn resume(&mut self) -> Result<()> {
         let pc = self.get_pc()?;
-        let maybe_bp_id = {
-            if let Some(bp) = self.breakpoint_sites.get_by_address_mut(pc) {
-                if !bp.is_enabled {
-                    None
-                } else {
-                    bp.disable(self.pid)?;
-                    Some(bp.id)
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some(bpid) = maybe_bp_id {
+        if self.breakpoint_sites.enabled_stoppoint_at_address(pc) {
+            let bp = self.breakpoint_sites.get_by_address_mut(pc).unwrap();
+            bp.disable(&mut self.registers)?;
             step(self.pid, None).map_err(|e| anyhow::anyhow!("Failed to single step: {}", e))?;
-
             waitpid(self.pid, None)?;
-            if let Some(bp) = self.breakpoint_sites.get_by_id_mut(bpid) {
-                bp.enable(self.pid)?;
-            }
+            bp.enable(&mut self.registers)?;
         }
 
         cont(self.pid, None).map_err(|e| anyhow::anyhow!("Failed to continue: {}", e))?;
@@ -238,7 +223,7 @@ impl Process {
     pub fn read_all_registers(&mut self) -> Result<()> {
         match getregs(self.pid) {
             Ok(r) => {
-                self.registers.regs = r;
+                self.registers.data.regs = r;
             }
             Err(e) => bail!("Could not read GPR registers: {}", e),
         }
@@ -248,7 +233,7 @@ impl Process {
                 PTRACE_GETFPREGS,
                 self.pid.as_raw() as i32,
                 ptr::null_mut::<c_void>(),
-                &mut self.registers.fp_regs as *mut _ as *mut c_void,
+                &mut self.registers.data.i387 as *mut _ as *mut c_void,
             )
         };
         if ret == -1 {
@@ -279,64 +264,10 @@ impl Process {
                 bail!("Could not read debug register {}: {}", info.name, err);
             }
 
-            self.registers.debug_regs[i] = data as u64;
+            self.registers.data.u_debugreg[i] = data as u64;
         }
 
         Ok(())
-    }
-
-    pub fn write_user_area(&self, offset: usize, data: u64) -> Result<()> {
-        if write_user(self.pid, offset as _, data as i64).is_err() {
-            bail!("Could not write to user area");
-        }
-        Ok(())
-    }
-
-    pub fn write_fprs(&self, fprs: &user_fpregs_struct) -> Result<()> {
-        unsafe {
-            let ret = ptrace(
-                PTRACE_SETFPREGS,
-                self.pid.as_raw(),
-                ptr::null_mut::<c_void>(),
-                fprs as *const _ as *mut c_void,
-            );
-            if ret != 0 {
-                let err = Error::last_os_error();
-                bail!("Could not write floating point registers: {}", err);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn write_gprs(&self, gprs: &user_regs_struct) -> Result<()> {
-        if setregs(self.pid, *gprs).is_err() {
-            bail!("Could not write general purpose registers");
-        }
-        Ok(())
-    }
-
-    pub fn write_register(&mut self, info: &RegisterInfo, val: RegisterValue) {
-        self.registers.write_raw(info, val);
-
-        if info.register_type == RegisterType::Fpr {
-            self.write_fprs(&self.registers.fp_regs)
-                .unwrap_or_else(|e| panic!("Failed to write FPR registers: {}", e));
-        } else {
-            // align offset down to 8 bytes and write that word
-            let aligned_offset = info.offset & !0b111;
-            let aligned_value = unsafe {
-                let aligned_ptr = (&self.registers.regs as *const _ as *const u8)
-                    .add(aligned_offset);
-                aligned_ptr.cast::<u64>().read()
-            };
-            self.write_user_area(aligned_offset, aligned_value)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "Failed to write GPR/debug at offset {}: {}",
-                        aligned_offset, e
-                    )
-                });
-        }
     }
 
     pub fn step_instruction(&mut self) -> Result<StopReason> {
@@ -347,7 +278,7 @@ impl Process {
         {
             if self.breakpoint_sites.enabled_stoppoint_at_address(pc) {
                 if let Some(bp) = self.breakpoint_sites.get_by_address_mut(pc) {
-                    bp.disable(self.pid)?;
+                    bp.disable(&mut self.registers)?;
                     // Store raw pointer so we can re-enable later
                     to_reenable = Some(bp as *mut _);
                 }
@@ -361,7 +292,7 @@ impl Process {
         if let Some(bp_ptr) = to_reenable {
             unsafe {
                 // SAFETY: we only use the pointer after the original borrow ends
-                (*bp_ptr).enable(self.pid)?;
+                (*bp_ptr).enable(&mut self.registers)?;
             }
         }
 
@@ -380,11 +311,11 @@ impl Process {
 
     pub fn set_pc(&mut self, addr: VirtAddr) -> Result<()> {
         let info = register_info_by_id(RegisterId::RIP);
-        self.write_register(info, RegisterValue::U64(addr.0));
+        write_register(self.pid, &mut self.registers, info, RegisterValue::U64(addr.0));
         Ok(())
     }
 
-    pub fn create_breakpoint_site(&mut self, addr: VirtAddr) -> &mut BreakpointSite {
+    pub fn create_breakpoint_site(&mut self, addr: VirtAddr, is_hardware: bool) -> Result<()> {
         if self.breakpoint_sites.contains_address(addr) {
             panic!("Breakpoint site already created at address {:#x}", addr.0);
         }
@@ -393,14 +324,19 @@ impl Process {
 
         let new_site = BreakpointSite {
             id: new_id,
+            pid: self.pid,
             address: addr,
             is_enabled: false,
             saved_data: 0,
+            is_internal: false,
+            hardware_register_index: -1,
+            is_hardware,
         };
 
         self.breakpoint_sites.stoppoints.push(new_site);
 
-        self.breakpoint_sites.stoppoints.last_mut().unwrap()
+        let breakpoint = self.breakpoint_sites.stoppoints.last_mut().unwrap();
+        breakpoint.enable(&mut self.registers)
     }
 
     pub fn read_memory(&self, address: VirtAddr, mut amount: usize) -> Result<Vec<u8>> {
@@ -456,7 +392,7 @@ impl Process {
         let sites = self.breakpoint_sites.get_in_region(address, address + amount.try_into().unwrap());
 
         for site in sites {
-            if !site.is_enabled() {
+            if !site.is_enabled() || site.is_hardware {
                 continue;
             }
             let offset = (site.address.0 - address.0) as usize;

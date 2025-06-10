@@ -2,7 +2,7 @@ use process::{handle_stop, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
 use nix::unistd::Pid;
-use registers::{register_info_by_name, RegisterType, UserRegisters, REGISTERS};
+use registers::{register_info_by_name, write_register, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
 use stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
 use utils::{parse_vector, print_hex_dump};
@@ -194,6 +194,9 @@ fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
         } else {
             println!("Current breakpoints:");
             for site in &process.breakpoint_sites.stoppoints {
+                if site.is_internal {
+                    continue;
+                }
                 println!(
                     "{}: address = {:#x}, {}",
                     site.id,
@@ -217,9 +220,9 @@ fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
             }
         };
 
-        let pid = process.pid.clone();
-        process.create_breakpoint_site(VirtAddr(address)).enable(pid)?;
-        return Ok(());
+        let is_hardware = args.len() == 4 && args[3] == "-h";
+        println!("hardware: {}", is_hardware);
+        return process.create_breakpoint_site(VirtAddr(address), is_hardware);
     }
 
     let id = match args[2].parse::<i32>() {
@@ -232,18 +235,18 @@ fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
 
     if command.starts_with("enable") {
         if let Some(site) = process.breakpoint_sites.get_by_id_mut(id) {
-            site.enable(process.pid)?;
+            site.enable(&mut process.registers)?;
         } else {
             eprintln!("No breakpoint with id {}", id);
         }
     } else if command.starts_with("disable") {
         if let Some(site) = process.breakpoint_sites.get_by_id_mut(id) {
-            site.disable(process.pid)?;
+            site.disable(&mut process.registers)?;
         } else {
             eprintln!("No breakpoint with id {}", id);
         }
     } else if command.starts_with("delete") {
-        process.breakpoint_sites.remove_by_id(process.pid, id)?;
+        process.breakpoint_sites.remove_by_id(&mut process.registers, id)?;
     } else {
         print_help(&["help", "breakpoint"]);
     }
@@ -311,7 +314,7 @@ fn handle_register_write(process: &mut Process, args: &[&str]) {
         }
     };
 
-    process.write_register(info, value);
+    write_register(process.pid, &mut process.registers, info, value);
 }
 
 fn print_disassembly(process: &Process, address: VirtAddr, n_instructions: usize) {
@@ -338,6 +341,7 @@ fn print_help(args: &[&str]) {
             println!("    disable <id>");
             println!("    enable <id>");
             println!("    set <address>");
+            println!("    set <address> -h");
         }
         ["help", cmd] if cmd.starts_with("register") => {
             println!("Available register commands:");
