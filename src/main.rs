@@ -280,7 +280,7 @@ pub fn handle_register_read(process: &Process, args: &[&str]) {
             }
 
             let value = process.registers.read(info);
-            let formatted = format_register_value(&value);
+            let formatted = format_register_value(info.name, &value);
             println!("{}:\t{}", info.name, formatted);
         }
     } else if args.len() == 3 {
@@ -288,7 +288,7 @@ pub fn handle_register_read(process: &Process, args: &[&str]) {
         match register_info_by_name(reg_name) {
             info => {
                 let value = process.registers.read(info);
-                let formatted = format_register_value(&value);
+                let formatted = format_register_value(reg_name, &value);
                 println!("{}:\t{}", info.name, formatted);
             }
         }
