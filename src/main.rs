@@ -4,12 +4,13 @@ use copperline::Copperline;
 use nix::unistd::Pid;
 use registers::{register_info_by_name, write_register, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
-use stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
+use stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
 use utils::{parse_vector, print_hex_dump};
 
 mod utils;
 mod process;
 mod breakpoints;
+mod watchpoint;
 mod stoppoint;
 mod registers;
 mod registers_io;
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
             is_attached: true,
             registers: user_registers,
             breakpoint_sites: StoppointCollection::new(),
+            watchpoint_sites: StoppointCollection::new(),
         };
         process.attach()?;
         main_loop(&mut process)?;
@@ -66,6 +68,8 @@ fn main_loop(process: &mut Process) -> Result<()> {
                 handle_memory_command(process, &args)?;
             } else if command.starts_with("dis") {
                 handle_disassemble_command(process, &args);
+            } else if command.starts_with("watch") {
+                handle_watchpoint_command(process, &args)?;
             } else if command.starts_with("help") {
                 print_help(&args);
             } else {
@@ -73,6 +77,106 @@ fn main_loop(process: &mut Process) -> Result<()> {
             }
 
             cl.add_history(line);
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_watchpoint_command(process: &mut Process, args: &[&str]) -> Result<()> {
+    let command = args[1];
+
+    if command == "list" {
+        if process.watchpoint_sites.stoppoints.is_empty() {
+            println!("No watchpoints set");
+        } else {
+            println!("Current watchpoints:");
+            for wp in &process.watchpoint_sites.stoppoints {
+                println!(
+                    "{}: address = {:#x}, size = {}, mode = {:?}, {}",
+                    wp.id,
+                    wp.address.0,
+                    wp.size,
+                    wp.mode,
+                    if wp.is_enabled { "enabled" } else { "disabled" }
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if command == "set" {
+        if args.len() < 3 {
+            eprintln!("Usage: watchpoint set <address> [mode] [size]");
+            return Ok(());
+        }
+
+        let addr_str = args[2].strip_prefix("0x").unwrap_or(args[2]);
+        let address = match u64::from_str_radix(addr_str, 16) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("Invalid address format");
+                return Ok(());
+            }
+        };
+
+        let mode = if args.len() >= 4 {
+            match args[3].to_lowercase().as_str() {
+                "write" => StoppointMode::Write,
+                "readwrite" => StoppointMode::ReadWrite,
+                "execute" => StoppointMode::Execute,
+                _ => {
+                    eprintln!("Unknown watchpoint mode. Use: write, readwrite, execute");
+                    return Ok(());
+                }
+            }
+        } else {
+            StoppointMode::Write // default
+        };
+
+        let size = if args.len() >= 5 {
+            match args[4].parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("Invalid watchpoint size");
+                    return Ok(());
+                }
+            }
+        } else {
+            1 // default
+        };
+
+        return process.create_watchpoint(VirtAddr(address), mode, size);
+    }
+
+    let id = match args.get(2).and_then(|s| s.parse::<i32>().ok()) {
+        Some(id) => id,
+        None => {
+            eprintln!("Expected watchpoint ID");
+            return Ok(());
+        }
+    };
+
+    match command {
+        "enable" => {
+            if let Some(wp) = process.watchpoint_sites.get_by_id_mut(id) {
+                wp.enable(&mut process.registers)?;
+            } else {
+                eprintln!("No watchpoint with id {}", id);
+            }
+        }
+        "disable" => {
+            if let Some(wp) = process.watchpoint_sites.get_by_id_mut(id) {
+                wp.disable(&mut process.registers)?;
+            } else {
+                eprintln!("No watchpoint with id {}", id);
+            }
+        }
+        "delete" => {
+            process.watchpoint_sites.remove_by_id(&mut process.registers, id)?;
+        }
+        _ => {
+            print_help(&["help", "watchpoint"]);
         }
     }
 

@@ -19,8 +19,9 @@ use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 use crate::breakpoints::BreakpointSite;
 use crate::print_disassembly;
 use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
-use crate::stoppoint::{Stoppoint, StoppointCollection, VirtAddr};
+use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
 use crate::utils::FromBytes;
+use crate::watchpoint::Watchpoint;
 
 #[derive(PartialEq, Eq)]
 pub enum Pstatus {
@@ -43,6 +44,7 @@ pub struct Process {
     pub is_attached: bool,
     pub registers: UserRegisters,
     pub breakpoint_sites: StoppointCollection<BreakpointSite>,
+    pub watchpoint_sites: StoppointCollection<Watchpoint>,
 }
 
 pub struct Instruction {
@@ -68,6 +70,7 @@ pub fn handle_stop(process: &mut Process, reason: StopReason) {
 }
 
 static NEXT_BREAKPOINT_ID: AtomicI32 = AtomicI32::new(1);
+static NEXT_WATCHPOINT_ID: AtomicI32 = AtomicI32::new(1);
 
 impl Drop for Process {
     fn drop(&mut self) {
@@ -147,6 +150,7 @@ impl Process {
                     is_attached: true,
                     registers: user_registers,
                     breakpoint_sites: StoppointCollection::new(),
+                    watchpoint_sites: StoppointCollection::new(),
                 })
             }
             Ok(ForkResult::Child) => {
@@ -312,6 +316,36 @@ impl Process {
     pub fn set_pc(&mut self, addr: VirtAddr) -> Result<()> {
         let info = register_info_by_id(RegisterId::RIP);
         write_register(self.pid, &mut self.registers, info, RegisterValue::U64(addr.0));
+        Ok(())
+    }
+
+    pub fn create_watchpoint(&mut self, address: VirtAddr, mode: StoppointMode, size: usize) -> Result<()> {
+        if self.watchpoint_sites.contains_address(address) {
+            panic!("Watchpoint already exists at address {:#x}", address.0);
+        }
+
+        let id = NEXT_WATCHPOINT_ID.fetch_add(1, Ordering::SeqCst);
+
+        let watchpoint = Watchpoint {
+            id,
+            pid: self.pid,
+            address,
+            is_enabled: false,
+            hardware_register_index: -1,
+            mode,
+            size,
+        };
+
+        self.watchpoint_sites.stoppoints.push(watchpoint);
+
+        let wp = self.watchpoint_sites.stoppoints.last_mut().unwrap();
+        wp.enable(&mut self.registers)?;
+
+        println!(
+            "Set watchpoint {} at {:#x} (mode = {:?}, size = {})",
+            wp.id, wp.address.0, wp.mode, wp.size
+        );
+
         Ok(())
     }
 
