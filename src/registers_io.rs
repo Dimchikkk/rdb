@@ -3,30 +3,16 @@ use std::str::FromStr;
 
 use crate::registers::{RegisterFormat, RegisterInfo, RegisterValue};
 
-pub fn format_register_value(value: &RegisterValue) -> String {
-    match value {
-        RegisterValue::F32(f) => format!("{}", f),
-        RegisterValue::F64(f) => format!("{}", f),
-
-        // Special case: decode st0 as float
-        RegisterValue::Bytes128(bytes) if bytes.len() >= 10 => {
-            // For ST0...ST7 registers, decode 80-bit float:
-            // You can do a heuristic or pass info that this is st0 here,
-            // but assuming only for demonstration that this is st0:
+pub fn format_register_value(reg_name: &str, value: &RegisterValue) -> String {
+    match (reg_name, value) {
+        // Format st0..st7 as 80-bit float (only first 10 bytes)
+        (name, RegisterValue::Bytes128(bytes)) if name.starts_with("st") && bytes.len() >= 10 => {
             let f = decode_f80_to_f64(&bytes[0..10]);
             format!("{}", f)
         }
 
-        RegisterValue::U8(v) => format!("0x{:02x}", v),
-        RegisterValue::U16(v) => format!("0x{:04x}", v),
-        RegisterValue::U32(v) => format!("0x{:08x}", v),
-        RegisterValue::U64(v) => format!("0x{:016x}", v),
-        RegisterValue::I8(v) => format!("0x{:02x}", v),
-        RegisterValue::I16(v) => format!("0x{:04x}", v),
-        RegisterValue::I32(v) => format!("0x{:08x}", v),
-        RegisterValue::I64(v) => format!("0x{:016x}", v),
-
-        RegisterValue::Bytes64(bytes) => {
+        // Format mm0..mm7 as 8 bytes hex array (Bytes64)
+        (name, RegisterValue::Bytes64(bytes)) if name.starts_with("mm") && bytes.len() == 8 => {
             let mut s = String::from("[");
             for (i, b) in bytes.iter().enumerate() {
                 if i > 0 { s.push_str(", "); }
@@ -35,7 +21,45 @@ pub fn format_register_value(value: &RegisterValue) -> String {
             s.push(']');
             s
         }
-        RegisterValue::Bytes128(bytes) => {
+
+        // Format xmm registers as 16 bytes hex array (Bytes128)
+        (name, RegisterValue::Bytes128(bytes)) if name.starts_with("xmm") && bytes.len() == 16 => {
+            let mut s = String::from("[");
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 { s.push_str(", "); }
+                write!(s, "0x{:02x}", b).unwrap();
+            }
+            s.push(']');
+            s
+        }
+
+        // Other float types
+        (_, RegisterValue::F32(f)) => format!("{}", f),
+        (_, RegisterValue::F64(f)) => format!("{}", f),
+
+        // Other integers
+        (_, RegisterValue::U8(v)) => format!("0x{:02x}", v),
+        (_, RegisterValue::U16(v)) => format!("0x{:04x}", v),
+        (_, RegisterValue::U32(v)) => format!("0x{:08x}", v),
+        (_, RegisterValue::U64(v)) => format!("0x{:016x}", v),
+        (_, RegisterValue::I8(v)) => format!("0x{:02x}", v),
+        (_, RegisterValue::I16(v)) => format!("0x{:04x}", v),
+        (_, RegisterValue::I32(v)) => format!("0x{:08x}", v),
+        (_, RegisterValue::I64(v)) => format!("0x{:016x}", v),
+
+        // Fallback for Bytes64 (non-mm)
+        (_, RegisterValue::Bytes64(bytes)) => {
+            let mut s = String::from("[");
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 { s.push_str(", "); }
+                write!(s, "0x{:02x}", b).unwrap();
+            }
+            s.push(']');
+            s
+        }
+
+        // Fallback for Bytes128 (non-st/xmm)
+        (_, RegisterValue::Bytes128(bytes)) => {
             let mut s = String::from("[");
             for (i, b) in bytes.iter().enumerate() {
                 if i > 0 { s.push_str(", "); }
@@ -98,43 +122,33 @@ pub fn f64_to_x87_long_double_bytes(value: f64) -> [u8; 16] {
     let mut bytes = [0u8; 16];
 
     if exp == 0 && frac == 0 {
-        // Zero
-        // all bytes zero except sign bit in highest bit of exponent field
-        // Exponent is 0
-        // Integer bit = 0
-        // Leave bytes zero (already zero)
-        // but set sign bit in exponent high byte
+        // Zero: exponent = 0, integer bit = 0, fraction = 0
+        // Sign bit stored in bit 15 of exponent (byte 9, bit 7)
         if sign != 0 {
-            bytes[9] = 0x80; // sign bit at bit 15 of exponent (2nd last byte)
+            bytes[9] = 0x80;
         }
         return bytes;
     }
 
     if exp == 0x7FF {
-        // Inf or NaN - can be handled specially if needed
+        // Inf or NaN - here we just return zeros for now (can improve later)
         return bytes;
     }
 
-    // Calculate extended exponent = double exponent - 1023 + 16383
+    // Convert double exponent to extended precision exponent with bias difference
     let ext_exp = (exp - 1023 + 16383) as u16;
 
-    // Construct 64-bit fraction with explicit integer bit (bit 63 = 1)
-    let ext_frac = (1u64 << 63) | (frac << (63 - 52)); // shift mantissa to top bits
+    // Construct extended fraction with explicit integer bit (bit 63 = 1)
+    let ext_frac = (1u64 << 63) | (frac << (63 - 52)); 
 
-    // Pack into bytes (little endian):
-    // Bytes 0..7 = ext_frac (64 bits)
-    // Bytes 8..9 = ext_exp + sign in top bit of exponent (15 bits exponent + sign bit)
-    // Bytes 10..15 = padding zero
-
-    // Write fraction (64 bits)
+    // Write fraction (64 bits, little endian)
     bytes[0..8].copy_from_slice(&ext_frac.to_le_bytes());
 
-    // Write exponent (15 bits) and sign bit
+    // Write exponent (15 bits) and sign bit (bit 15)
     let exp_and_sign = (ext_exp & 0x7FFF) | ((sign as u16) << 15);
     bytes[8..10].copy_from_slice(&exp_and_sign.to_le_bytes());
 
-    // bytes[10..16] = 0 (already zero)
-
+    // Remaining bytes [10..16] stay zero (padding)
     bytes
 }
 
@@ -142,7 +156,6 @@ pub fn parse_register_value(
     info: &RegisterInfo,
     text: &str,
 ) -> Result<RegisterValue, String> {
-    // Helper to strip optional “0x” / “0X”
     fn strip_0x(s: &str) -> &str {
         if s.starts_with("0x") || s.starts_with("0X") {
             &s[2..]
@@ -209,13 +222,13 @@ pub fn parse_register_value(
                     info.name, info.size
                 ));
             }
-            // Try parsing a single float first
+            // Try parsing as f64 first
             if let Ok(f) = text.parse::<f64>() {
                 let bytes = f64_to_x87_long_double_bytes(f);
                 return Ok(RegisterValue::Bytes128(bytes));
             }
 
-            // Else parse as 16 comma-separated bytes (old behavior)
+            // Otherwise parse as 16 comma-separated bytes
             let parts: Vec<&str> = text.split(',').map(str::trim).collect();
             if parts.len() != 16 {
                 return Err(format!(
@@ -224,7 +237,7 @@ pub fn parse_register_value(
                     parts.len()
                 ));
             }
-            let mut bytes = [0_u8; 16];
+            let mut bytes = [0u8; 16];
             for (i, piece) in parts.iter().enumerate() {
                 let raw = u8::from_str_radix(strip_0x(piece), 16)
                     .map_err(|e| format!("Invalid byte {} for {}: {}", piece, info.name, e))?;
@@ -244,7 +257,7 @@ pub fn parse_register_value(
             let parts: Vec<&str> = text.split(',').map(str::trim).collect();
             if parts.len() != expected_len {
                 return Err(format!(
-                    "{}: Expected {} comma‐separated bytes, found {}",
+                    "{}: Expected {} comma-separated bytes, found {}",
                     info.name,
                     expected_len,
                     parts.len()
