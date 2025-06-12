@@ -1,7 +1,1 @@
 /target
-/test_programs/hello_world
-/test_programs/hello_world_once
-/test_programs/reg_read.o
-/test_programs/reg_read
-/test_programs/anti_debugger
-/test_programs/watchpoint

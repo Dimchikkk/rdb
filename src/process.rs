@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Read;
+use std::marker::PhantomData;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use nix::fcntl::OFlag;
@@ -11,7 +12,7 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::sys::ptrace::{attach, cont, detach, getregs, step, traceme };
 use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER};
+use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER};
 use libc::{ptrace, c_void};
 use std::{mem, ptr};
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
@@ -23,7 +24,7 @@ use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
 use crate::utils::FromBytes;
 use crate::watchpoint::Watchpoint;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Pstatus {
     Stopped,
     Running,
@@ -37,6 +38,7 @@ pub struct StopReason {
     signal: String,
 }
 
+#[derive(Clone)]
 pub struct Process {
     pub pid: Pid,
     pub status: Option<Pstatus>,
@@ -45,6 +47,7 @@ pub struct Process {
     pub registers: UserRegisters,
     pub breakpoint_sites: StoppointCollection<BreakpointSite>,
     pub watchpoint_sites: StoppointCollection<Watchpoint>,
+    pub _not_send_or_sync: PhantomData<*mut ()>,
 }
 
 pub struct Instruction {
@@ -91,6 +94,9 @@ impl Drop for Process {
         }
     }
 }
+
+unsafe impl Send for Process {}
+unsafe impl Sync for Process {}
 
 impl Process {
     pub fn attach(&mut self) -> Result<()> {
@@ -151,13 +157,13 @@ impl Process {
                     registers: user_registers,
                     breakpoint_sites: StoppointCollection::new(),
                     watchpoint_sites: StoppointCollection::new(),
+                    _not_send_or_sync: PhantomData,
                 })
             }
             Ok(ForkResult::Child) => {
                 let read_raw_fd = read_fd.into_raw_fd();
                 let write_raw_fd = write_fd.into_raw_fd();
 
-                // Disable ASLR by setting personality flag
                 unsafe {
                     let current = personality(0xffffffff);
                     if current == -1 {
@@ -166,9 +172,15 @@ impl Process {
                         std::process::exit(1);
                     }
 
-                    // Add ADDR_NO_RANDOMIZE flag
+                    // Add ADDR_NO_RANDOMIZE flag, to disable ASLR
                     if personality((current | ADDR_NO_RANDOMIZE) as c_ulong) == -1 {
                         let err = "Failed to set personality to disable ASLR";
+                        write_to_pipe(write_raw_fd, err);
+                        std::process::exit(1);
+                    }
+
+                    if setpgid(0, 0) < 0 {
+                        let err = "Could not set pgid";
                         write_to_pipe(write_raw_fd, err);
                         std::process::exit(1);
                     }

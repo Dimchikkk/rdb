@@ -129,6 +129,7 @@ pub trait Stoppoint {
     }
 }
 
+#[derive(Clone)]
 pub struct StoppointCollection<T: Stoppoint> {
     pub stoppoints: Vec<T>,
 }

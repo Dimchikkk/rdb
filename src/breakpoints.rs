@@ -6,6 +6,7 @@ use std::io::Error;
 
 use crate::{registers::UserRegisters, stoppoint::{Stoppoint, StoppointMode, VirtAddr}};
 
+#[derive(Clone)]
 pub struct BreakpointSite {
     pub id: i32,
     pub pid: Pid,

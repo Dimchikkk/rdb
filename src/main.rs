@@ -1,11 +1,14 @@
+use std::{marker::PhantomData, sync::{LazyLock, Mutex}};
+
 use process::{handle_stop, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
-use nix::unistd::Pid;
 use registers::{register_info_by_name, write_register, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
 use stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
 use utils::{parse_vector, print_hex_dump};
+use nix::{sys::signal::{kill, SigHandler, Signal::{self, SIGINT}}, unistd::Pid};
+use nix::sys::signal::signal;
 
 mod utils;
 mod process;
@@ -14,6 +17,14 @@ mod watchpoint;
 mod stoppoint;
 mod registers;
 mod registers_io;
+
+static G_RDB_PROCESS: LazyLock<Mutex<Option<Process>>> = LazyLock::new(|| Mutex::new(None));
+
+extern "C" fn handle_sigint(_sig: i32) {
+    if let Some(process) = G_RDB_PROCESS.lock().unwrap().as_ref() {
+        let _ = kill(process.pid, Signal::SIGSTOP);
+    }
+}
 
 fn main() -> Result<()> {
     let mut args = std::env::args();
@@ -35,6 +46,7 @@ fn main() -> Result<()> {
             registers: user_registers,
             breakpoint_sites: StoppointCollection::new(),
             watchpoint_sites: StoppointCollection::new(),
+            _not_send_or_sync: PhantomData,
         };
         process.attach()?;
         main_loop(&mut process)?;
@@ -47,6 +59,15 @@ fn main() -> Result<()> {
 }
 
 fn main_loop(process: &mut Process) -> Result<()> {
+    {
+        let mut global = G_RDB_PROCESS.lock().unwrap();
+        *global = Some(process.clone());
+    }
+
+    unsafe {
+        let _ = signal(SIGINT, SigHandler::Handler(handle_sigint));
+    }
+
     let mut cl = Copperline::new();
     while let Ok(line) = cl.read_line("rdb> ", copperline::Encoding::Utf8) {
         if !line.trim().is_empty() {

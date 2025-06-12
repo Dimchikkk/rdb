@@ -3,6 +3,7 @@ use anyhow::Result;
 
 use crate::stoppoint::{Stoppoint, StoppointMode, VirtAddr};
 
+#[derive(Clone)]
 pub struct Watchpoint {
     pub id: i32,
     pub pid: Pid,
