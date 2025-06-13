@@ -6,6 +6,8 @@ use copperline::Copperline;
 use registers::{register_info_by_name, write_register, RegisterType, UserRegisters, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
 use stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
+use syscall::SyscallCatchPolicy;
+use sysnames::Syscalls;
 use utils::{parse_vector, print_hex_dump};
 use nix::{sys::signal::{kill, SigHandler, Signal::{self, SIGINT}}, unistd::Pid};
 use nix::sys::signal::signal;
@@ -13,6 +15,7 @@ use nix::sys::signal::signal;
 mod utils;
 mod process;
 mod breakpoints;
+mod syscall;
 mod watchpoint;
 mod stoppoint;
 mod registers;
@@ -46,6 +49,8 @@ fn main() -> Result<()> {
             registers: user_registers,
             breakpoint_sites: StoppointCollection::new(),
             watchpoint_sites: StoppointCollection::new(),
+            syscall_catch_policy: SyscallCatchPolicy::catch_none(),
+            expecting_syscall_exit: false,
             _not_send_or_sync: PhantomData,
         };
         process.attach()?;
@@ -74,9 +79,11 @@ fn main_loop(process: &mut Process) -> Result<()> {
             let args: Vec<&str> = line.split_whitespace().collect();
             let command = args[0];
 
-            if command.starts_with("c") {
+            if command.starts_with("catch") {
+                handle_catchpoint_command(process, &args)?;
+            } else if command.starts_with("c") {
                 process.resume()?;
-                let reason = process.wait_on_signal()?;
+                let reason = process.wait_on_signal().unwrap();
                 handle_stop(process, reason);
             } else if command.starts_with("reg") {
                 handle_register_command(process, &args);
@@ -99,6 +106,49 @@ fn main_loop(process: &mut Process) -> Result<()> {
 
             cl.add_history(line);
         }
+    }
+
+    Ok(())
+}
+
+fn handle_catchpoint_command(process: &mut Process, args: &[&str]) -> Result<()> {
+    if args.len() < 2 {
+        print_help(&["help", "catch"]);
+        return Ok(());
+    }
+
+    match args[1] {
+        cmd if cmd.starts_with("sys") => {
+            // default: catch all
+            let mut policy = SyscallCatchPolicy::catch_all();
+
+            if args.len() == 3 && args[2] == "none" {
+                policy = SyscallCatchPolicy::catch_none();
+            } else if args.len() >= 3 {
+                // split comma-separated list
+                let items = args[2].split(',').map(str::trim);
+                let mut to_catch = Vec::new();
+                for item in items {
+                    let id = if let Ok(n) = item.parse::<i32>() {
+                        n
+                    } else {
+                        // lookup by name
+                        match Syscalls::number(item) {
+                            Some(n) => n as i32,
+                            None => {
+                                eprintln!("Unknown syscall name: {}", item);
+                                return Ok(());
+                            }
+                        }
+                    };
+                    to_catch.push(id);
+                }
+                policy = SyscallCatchPolicy::catch_some(to_catch);
+            }
+
+            process.syscall_catch_policy = policy;
+        }
+        _ => print_help(&["help", "catch"]),
     }
 
     Ok(())
@@ -128,7 +178,7 @@ fn handle_watchpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
 
     if command == "set" {
         if args.len() < 3 {
-            eprintln!("Usage: watchpoint set <address> [mode] [size]");
+            eprintln!("Usage: watch set <address> [mode] [size]");
             return Ok(());
         }
 
@@ -197,7 +247,7 @@ fn handle_watchpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
             process.watchpoint_sites.remove_by_id(&mut process.registers, id)?;
         }
         _ => {
-            print_help(&["help", "watchpoint"]);
+            print_help(&["help", "watch"]);
         }
     }
 
@@ -242,7 +292,7 @@ fn handle_disassemble_command(process: &Process, args: &[&str]) {
 
 fn handle_memory_command(process: &mut Process, args: &[&str]) -> Result<()> {
     if args.len() < 3 {
-        print_help(&["help", "memory"]);
+        print_help(&["help", "mem"]);
         return Ok(());
     }
 
@@ -250,7 +300,7 @@ fn handle_memory_command(process: &mut Process, args: &[&str]) -> Result<()> {
         cmd if cmd.starts_with("read") => handle_memory_read_command(process, args),
         cmd if cmd.starts_with("write") => handle_memory_write_command(process, args),
         _ => {
-            print_help(&["help", "memory"]);
+            print_help(&["help", "mem"]);
             Ok(())
         }
     }
@@ -258,7 +308,7 @@ fn handle_memory_command(process: &mut Process, args: &[&str]) -> Result<()> {
 
 fn handle_memory_write_command(process: &mut Process, args: &[&str]) -> Result<()> {
     if args.len() < 4 {
-        print_help(&["help", "memory"]);
+        print_help(&["help", "mem"]);
         return Ok(());
     }
 
@@ -373,7 +423,7 @@ fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
     } else if command.starts_with("delete") {
         process.breakpoint_sites.remove_by_id(&mut process.registers, id)?;
     } else {
-        print_help(&["help", "breakpoint"]);
+        print_help(&["help", "break"]);
     }
 
     Ok(())
@@ -381,7 +431,7 @@ fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
 
 fn handle_register_command(process: &mut Process, args: &[&str]) {
     if args.len() < 2 {
-        print_help(&["help", "register"]);
+        print_help(&["help", "reg"]);
         return;
     }
 
@@ -390,7 +440,7 @@ fn handle_register_command(process: &mut Process, args: &[&str]) {
     } else if args[1].starts_with("write") {
         handle_register_write(process, args);
     } else {
-        print_help(&["help", "register"]);
+        print_help(&["help", "reg"]);
     }
 }
 
@@ -418,13 +468,13 @@ pub fn handle_register_read(process: &Process, args: &[&str]) {
             }
         }
     } else {
-         print_help(&["help", "register"]);
+         print_help(&["help", "reg"]);
     }
 }
 
 fn handle_register_write(process: &mut Process, args: &[&str]) {
     if args.len() != 4 {
-        print_help(&["help", "register"]);
+        print_help(&["help", "reg"]);
         return;
     }
 
@@ -453,13 +503,15 @@ fn print_help(args: &[&str]) {
     match args {
         ["help"] => {
             println!("Available commands:");
-            println!("    breakpoint  - Commands for operating on breakpoints");
-            println!("    continue    - Resume the process");
-            println!("    disassemble - Disassemble instructions from memory");
-            println!("    register    - Commands for operating on registers");
-            println!("    step        - Step over a single instruction");
+            println!("    break - Commands for operating on breakpoints");
+            println!("    c     - Resume the process");
+            println!("    dis   - Disassemble instructions from memory");
+            println!("    reg   - Commands for operating on registers");
+            println!("    step  - Step over a single instruction");
+            println!("    catch - Catch syscalls");
+            println!("    mem   - Read/write memory");
         }
-        ["help", cmd] if cmd.starts_with("breakpoint") => {
+        ["help", cmd] if cmd.starts_with("break") => {
             println!("Available breakpoint commands:");
             println!("    list");
             println!("    delete <id>");
@@ -468,17 +520,28 @@ fn print_help(args: &[&str]) {
             println!("    set <address>");
             println!("    set <address> -h");
         }
-        ["help", cmd] if cmd.starts_with("register") => {
+        ["help", cmd] if cmd.starts_with("catch") => {
+            println!("Available catchpoint commands:");
+            println!("    sys         - Catch all syscalls");
+            println!("    sys none    - Catch no syscalls");
+            println!("    sys <list>  - Catch specific syscalls by id or name, comma-separated");
+        }
+        ["help", cmd] if cmd.starts_with("reg") => {
             println!("Available register commands:");
             println!("    read");
             println!("    read <register>");
             println!("    read all");
             println!("    write <register> <value>");
         }
-        ["help", cmd] if cmd.starts_with("disassemble") => {
+        ["help", cmd] if cmd.starts_with("dis") => {
             println!("Available options:");
             println!("    -c <number of instructions>");
             println!("    -a <start address>");
+        }
+        ["help", cmd] if cmd.starts_with("mem") => {
+            println!("Available memory commands:");
+            println!("    mem read <address> [length]");
+            println!("    mem write <address> <byte1> [byte2 byte3 ...]");
         }
         _ => {
             println!("No help available on that");

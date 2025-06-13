@@ -1,6 +1,6 @@
 use std::mem::{offset_of, zeroed};
 use anyhow::{bail, Result};
-use nix::sys::ptrace::{setregs, write_user };
+use nix::sys::ptrace::write_user;
 use nix::unistd::Pid;
 use nix::libc::{self, user, user_fpregs_struct, user_regs_struct, PTRACE_SETFPREGS};
 use libc::{ptrace, c_void};
@@ -520,9 +520,9 @@ pub fn register_info_by_name(name: &str) -> &'static RegisterInfo {
     register_info_by(|reg| reg.name.to_lowercase() == name.to_lowercase())
 }
 
-pub fn register_info_by_dwarf(dwarf_id: i32) -> &'static RegisterInfo {
-    register_info_by(|reg| reg.dwarf_id == dwarf_id)
-}
+// pub fn register_info_by_dwarf(dwarf_id: i32) -> &'static RegisterInfo {
+//     register_info_by(|reg| reg.dwarf_id == dwarf_id)
+// }
 
 #[derive(Debug)]
 pub enum RegisterValue {
@@ -659,12 +659,12 @@ pub fn write_fprs(pid: Pid, fprs: &user_fpregs_struct) -> Result<()> {
     Ok(())
 }
 
-pub fn write_gprs(pid: Pid, gprs: &user_regs_struct) -> Result<()> {
-    if setregs(pid, *gprs).is_err() {
-        bail!("Could not write general purpose registers");
-    }
-    Ok(())
-}
+// pub fn write_gprs(pid: Pid, gprs: &user_regs_struct) -> Result<()> {
+//     if setregs(pid, *gprs).is_err() {
+//         bail!("Could not write general purpose registers");
+//     }
+//     Ok(())
+// }
 
 
 pub fn write_register(pid: Pid, registers: &mut UserRegisters, info: &RegisterInfo, val: RegisterValue) {

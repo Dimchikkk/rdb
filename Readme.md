@@ -20,9 +20,17 @@ Type `help` for usage:
 ```
 rdb> help
 Available commands:
-    breakpoint  - Commands for operating on breakpoints
-    continue    - Resume the process
-    disassemble - Disassemble instructions from memory
-    register    - Commands for operating on registers
-    step        - Step over a single instruction
+    break - Commands for operating on breakpoints
+    c     - Resume the process
+    dis   - Disassemble instructions from memory
+    reg   - Commands for operating on registers
+    step  - Step over a single instruction
+    catch - Catch syscalls
+    mem   - Read/write memory
+rdb> help catch
+Available catchpoint commands:
+    sys         - Catch all syscalls
+    sys none    - Catch no syscalls
+    sys <list>  - Catch specific syscalls by id or name, comma-separated
+rdb>
 ```

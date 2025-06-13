@@ -6,19 +6,21 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use nix::fcntl::OFlag;
 use nix::sys::signal::Signal::SIGTRAP;
+use sysnames::Syscalls;
 use std::os::unix::io::RawFd;
 use anyhow::{bail, Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::sys::ptrace::{attach, cont, detach, getregs, step, traceme };
+use nix::sys::ptrace::{attach, cont, detach, getregs, getsiginfo, step, syscall, traceme };
 use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, siginfo_t, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_GETSIGINFO, PTRACE_PEEKUSER, SI_KERNEL, TRAP_HWBKPT, TRAP_TRACE};
+use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_O_TRACESYSGOOD, PTRACE_PEEKUSER, PTRACE_SETOPTIONS};
 use libc::{ptrace, c_void};
 use std::{mem, ptr};
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
 use crate::breakpoints::BreakpointSite;
-use crate::{print_disassembly};
+use crate::syscall::{CatchPolicyMode, SyscallCatchPolicy, SyscallData, SyscallInformation};
+use crate::print_disassembly;
 use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
 use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
 use crate::utils::FromBytes;
@@ -37,6 +39,7 @@ pub struct StopReason {
     status: Option<u8>,
     signal: Option<Signal>,
     trap_reason: Option<TrapType>,
+    syscall_info: Option<SyscallInformation>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub enum TrapType {
     SingleStep,
     SoftwareBreak,
     HardwareBreak,
+    Syscall,
 }
 
 #[derive(Clone)]
@@ -55,6 +59,8 @@ pub struct Process {
     pub registers: UserRegisters,
     pub breakpoint_sites: StoppointCollection<BreakpointSite>,
     pub watchpoint_sites: StoppointCollection<Watchpoint>,
+    pub syscall_catch_policy: SyscallCatchPolicy,
+    pub expecting_syscall_exit: bool,
     pub _not_send_or_sync: PhantomData<*mut ()>,
 }
 
@@ -114,6 +120,34 @@ fn get_sigtrap_info(process: &mut Process, reason: &StopReason) {
     if reason.trap_reason == Some(TrapType::SingleStep) {
         println!(" (single step)");
     }
+
+    if reason.trap_reason == Some(TrapType::Syscall) {
+        if let Some(sys) = &reason.syscall_info {
+            if sys.entry {
+                let name = Syscalls::name(sys.id as u64)
+                    .unwrap_or_else(|| "unknown");
+
+                // extract the args array
+                if let SyscallData::Args(args) = &sys.data {
+                    // format each as hex, join with commas
+                    let args_str = args
+                        .iter()
+                        .map(|v| format!("{:#x}", v))
+                        .collect::<Vec<_>>()
+                        .join(",");
+
+                    println!(" (syscall entry)");
+                    println!(" syscall: {}({})", name, args_str);
+                }
+            } else {
+                // exit
+                println!(" (syscall exit)");
+                if let SyscallData::Ret(r) = sys.data {
+                    println!(" syscall returned: {:#x}", r);
+                }
+            }
+        }
+    }
 }
 
 static NEXT_BREAKPOINT_ID: AtomicI32 = AtomicI32::new(1);
@@ -155,7 +189,8 @@ impl Process {
         }
 
         attach(pid)?;
-        self.wait_on_signal()?;
+        self.wait_on_signal().unwrap();
+        set_ptrace_options(pid)?;
 
         println!("Attached to {}", pid);
         Ok(())
@@ -171,9 +206,13 @@ impl Process {
             bp.enable(&mut self.registers)?;
         }
 
-        cont(self.pid, None).map_err(|e| anyhow::anyhow!("Failed to continue: {}", e))?;
+        if *self.syscall_catch_policy.mode() == CatchPolicyMode::None {
+            cont(self.pid, None).map_err(|e| anyhow::anyhow!("Failed to continue: {}", e))?;
+        } else {
+            syscall(self.pid, None).map_err(|e| anyhow::anyhow!("Failed to continue: {}", e))?;
+        }
+
         self.status = Some(Pstatus::Running);
-        println!("Resumed process: {}", self.pid);
         Ok(())
     }
 
@@ -196,8 +235,11 @@ impl Process {
                 }
 
                 waitpid(child, None)?;
+                set_ptrace_options(child)?;
+
                 println!("Launched child process for {}: {}", program_path, child);
                 let user_registers = UserRegisters::new();
+
                 Ok(Process {
                     pid: child,
                     status: Some(Pstatus::Running),
@@ -206,6 +248,8 @@ impl Process {
                     registers: user_registers,
                     breakpoint_sites: StoppointCollection::new(),
                     watchpoint_sites: StoppointCollection::new(),
+                    syscall_catch_policy: SyscallCatchPolicy::catch_none(),
+                    expecting_syscall_exit: false,
                     _not_send_or_sync: PhantomData,
                 })
             }
@@ -263,6 +307,7 @@ impl Process {
                             status: Some(status as u8),
                             signal: None,
                             trap_reason: None,
+                            syscall_info: None,
                         })
                     },
                     WaitStatus::Signaled(_pid, signal, _) => {
@@ -272,6 +317,7 @@ impl Process {
                             status: None,
                             signal: Some(signal),
                             trap_reason: None,
+                            syscall_info: None,
                         })
                     },
                     WaitStatus::Stopped(_pid, signal) => {
@@ -281,6 +327,7 @@ impl Process {
                             status: None,
                             signal: Some(signal),
                             trap_reason: None,
+                            syscall_info: None,
                         };
                         if self.is_attached == true {
                             self.read_all_registers()?;
@@ -288,30 +335,51 @@ impl Process {
 
                             let instr_begin = self.get_pc()? - 1;
                             let is_sigtrap = signal == SIGTRAP;
-                            if reason.trap_reason == Some(TrapType::SoftwareBreak) &&
-                                is_sigtrap && self.breakpoint_sites.enabled_stoppoint_at_address(instr_begin) {
-                                    self.set_pc(instr_begin)?;
-                                } else if reason.trap_reason == Some(TrapType::HardwareBreak) {
-                                    let id = self.get_current_hardware_stoppoint()?;
+                            let is_software_breakpoint = reason.trap_reason == Some(TrapType::SoftwareBreak);
 
-                                    match id {
-                                        HardwareStoppoint::Breakpoint(_) => {}
-                                        HardwareStoppoint::Watchpoint(id) => {
-                                            let (address, size) = {
-                                                let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
-                                                (watchpoint.address(), watchpoint.size)
-                                            };
+                            if  is_software_breakpoint && is_sigtrap && self.breakpoint_sites.enabled_stoppoint_at_address(instr_begin) {
+                                self.set_pc(instr_begin)?;
+                            }
 
-                                            let memory = self.read_memory(address, size)?;
+                            if reason.trap_reason == Some(TrapType::HardwareBreak) {
+                                let id = self.get_current_hardware_stoppoint()?;
+
+                                match id {
+                                    HardwareStoppoint::Breakpoint(_) => {}
+                                    HardwareStoppoint::Watchpoint(id) => {
+                                        let (address, size) = {
                                             let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
-                                            watchpoint.update_data(&memory);
-                                        }
+                                            (watchpoint.address(), watchpoint.size)
+                                        };
+
+                                        let memory = self.read_memory(address, size)?;
+                                        let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
+                                        watchpoint.update_data(&memory);
                                     }
                                 }
+                            }
                         }
                         Ok(reason)
                     },
-                    _ => bail!("Process is not stopped: {}", self.pid),
+                    WaitStatus::PtraceSyscall(_pid) => {
+                        self.status = Some(Pstatus::Stopped);
+                        let mut reason = StopReason {
+                            reason: Pstatus::Stopped,
+                            status: None,
+                            signal: Some(SIGTRAP),
+                            trap_reason: Some(TrapType::Syscall),
+                            syscall_info: None,
+                        };
+                        if self.is_attached == true {
+                            self.read_all_registers()?;
+                            self.augment_stop_reason(&mut reason)?;
+                            if reason.trap_reason == Some(TrapType::Syscall) {
+                                reason = self.maybe_resume_from_syscall(reason)?;
+                            }
+                        }
+                        Ok(reason)
+                    },
+                    e => bail!("Process is not stopped {}: {:?}", self.pid, e),
                 };
                 reason
             },
@@ -385,7 +453,7 @@ impl Process {
 
         step(self.pid, None).with_context(|| "Could not single step")?;
 
-        let reason = self.wait_on_signal()?;
+        let reason = self.wait_on_signal().unwrap();
 
         if let Some(bp_ptr) = to_reenable {
             unsafe {
@@ -626,30 +694,53 @@ impl Process {
         result
     }
 
-    pub fn augment_stop_reason(&self, reason: &mut StopReason) -> Result<()> {
-        let mut info: siginfo_t = unsafe { std::mem::zeroed() };
+    pub fn augment_stop_reason(&mut self, reason: &mut StopReason) -> Result<()> {
+        let info = getsiginfo(self.pid)
+            .map_err(|e| anyhow::anyhow!("Failed to getsiginfo: {}", e))?;
 
-        let ret = unsafe {
-            ptrace(
-                PTRACE_GETSIGINFO,
-                self.pid.as_raw(),
-                std::ptr::null_mut::<c_void>(),
-                &mut info as *mut _ as *mut c_void,
-            )
-        };
+        if reason.trap_reason == Some(TrapType::Syscall) {
+            let sys_info = reason.syscall_info.get_or_insert_with(|| SyscallInformation {
+                id: 0,
+                entry: true,
+                data: SyscallData::Args([0; 6]),
+            });
 
-        if ret == -1 {
-            let err = std::io::Error::last_os_error();
-            bail!("Failed to get signal info: {}", err);
+            if self.expecting_syscall_exit {
+                sys_info.entry = false;
+                sys_info.id = self.read_register_as_u64(RegisterId::ORIG_RAX)? as u16;
+                let ret_val = self.read_register_as_u64(RegisterId::RAX)? as i64;
+                sys_info.data = SyscallData::Ret(ret_val);
+                self.expecting_syscall_exit = false;
+            } else {
+                sys_info.entry = true;
+                sys_info.id = self.read_register_as_u64(RegisterId::ORIG_RAX)? as u16;
+
+                let arg_regs = [
+                    RegisterId::RDI, RegisterId::RSI, RegisterId::RDX,
+                    RegisterId::R10, RegisterId::R8,  RegisterId::R9,
+                ];
+                let mut args = [0u64; 6];
+                for (i, reg) in arg_regs.iter().enumerate() {
+                    args[i] = self.read_register_as_u64(reg.clone())?;
+                }
+                sys_info.data = SyscallData::Args(args);
+                self.expecting_syscall_exit = true;
+            }
+
+            reason.signal = Some(SIGTRAP);
+            reason.trap_reason = Some(TrapType::Syscall);
+            return Ok(());
         }
+
+        self.expecting_syscall_exit = false;
 
         reason.trap_reason = None;
 
         if reason.signal == Some(SIGTRAP) {
             reason.trap_reason = match info.si_code {
-                TRAP_TRACE => Some(TrapType::SingleStep),
-                SI_KERNEL => Some(TrapType::SoftwareBreak),
-                TRAP_HWBKPT => Some(TrapType::HardwareBreak),
+                libc::TRAP_TRACE => Some(TrapType::SingleStep),
+                libc::SI_KERNEL => Some(TrapType::SoftwareBreak),
+                libc::TRAP_HWBKPT => Some(TrapType::HardwareBreak),
                 _ => None,
             };
         }
@@ -697,6 +788,30 @@ impl Process {
             bail!("Address at DR{} not recognized as breakpoint or watchpoint", index);
         }
     }
+
+    fn read_register_as_u64(&self, reg_id: RegisterId) -> Result<u64> {
+        let reg_info = register_info_by_id(reg_id.clone());
+        match self.registers.read(reg_info) {
+            RegisterValue::U64(val) => Ok(val),
+            other => bail!("Unexpected value for {:?}: {:?}", reg_id, other),
+        }
+    }
+
+    fn maybe_resume_from_syscall(&mut self, reason: StopReason) -> Result<StopReason> {
+        if *self.syscall_catch_policy.mode() == CatchPolicyMode::Some {
+            let to_catch = self.syscall_catch_policy.to_catch();
+
+            if let Some(sys_info) = &reason.syscall_info {
+                if !to_catch.contains(&(sys_info.id as i32)) {
+                    self.resume()?;
+                    // NOTE: recursive solution chosen for simplicity, will be refactored later
+                    return self.wait_on_signal();
+                }
+            }
+        }
+
+        Ok(reason)
+    }
 }
 
 fn write_to_pipe(write_fd: RawFd, message: &str) {
@@ -707,4 +822,15 @@ fn write_to_pipe(write_fd: RawFd, message: &str) {
             message.len(),
         );
     }
+}
+
+fn set_ptrace_options(pid: Pid) -> Result<()> {
+    let res = unsafe {
+        ptrace(PTRACE_SETOPTIONS, pid, std::ptr::null_mut::<c_void>(), PTRACE_O_TRACESYSGOOD)
+    };
+
+    if res < 0 {
+        bail!("Failed to set TRACESYSGOOD option");
+    }
+    Ok(())
 }
