@@ -12,13 +12,13 @@ use nix::sys::wait::{waitpid, WaitStatus};
 use nix::sys::ptrace::{attach, cont, detach, getregs, step, traceme };
 use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
 use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_PEEKUSER};
+use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, siginfo_t, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_GETSIGINFO, PTRACE_PEEKUSER, SI_KERNEL, TRAP_HWBKPT, TRAP_TRACE};
 use libc::{ptrace, c_void};
 use std::{mem, ptr};
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
 use crate::breakpoints::BreakpointSite;
-use crate::print_disassembly;
+use crate::{print_disassembly};
 use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
 use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
 use crate::utils::FromBytes;
@@ -34,8 +34,16 @@ pub enum Pstatus {
 
 pub struct StopReason {
     reason: Pstatus,
-    status: u8,
-    signal: String,
+    status: Option<u8>,
+    signal: Option<Signal>,
+    trap_reason: Option<TrapType>,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum TrapType {
+    SingleStep,
+    SoftwareBreak,
+    HardwareBreak,
 }
 
 #[derive(Clone)]
@@ -61,10 +69,15 @@ pub fn handle_stop(process: &mut Process, reason: StopReason) {
     println!("Process {} stopped at address 0x{:x}", process.pid, rip);
 
     match reason.reason {
-        Pstatus::Stopped => println!("stopped with signal {}", reason.signal),
-        Pstatus::Running => panic!("unreachable print_stop_reason"),
-        Pstatus::Terminated => println!("terminated with signal: {}", reason.signal),
-        Pstatus::Exited => println!("exited with status {}", reason.status),
+        Pstatus::Stopped => {
+            println!("stopped with signal {}", reason.signal.unwrap().to_string());
+            if reason.signal == Some(SIGTRAP) {
+                get_sigtrap_info(process, &reason);
+            }
+        }
+        Pstatus::Running => panic!("unreachable handle_stop"),
+        Pstatus::Terminated => println!("terminated with signal: {}", reason.signal.unwrap().to_string()),
+        Pstatus::Exited => println!("exited with status {}", reason.status.unwrap().to_string()),
     }
 
     if reason.reason == Pstatus::Stopped {
@@ -72,8 +85,44 @@ pub fn handle_stop(process: &mut Process, reason: StopReason) {
     }
 }
 
+fn get_sigtrap_info(process: &mut Process, reason: &StopReason) {
+    if reason.trap_reason == Some(TrapType::SoftwareBreak) {
+        let pc = process.get_pc().unwrap();
+        let site = process.breakpoint_sites.get_by_address_mut(pc).unwrap();
+        println!(" (breakpoint {})", site.id());
+    }
+
+    if reason.trap_reason == Some(TrapType::HardwareBreak) {
+        let id = process.get_current_hardware_stoppoint().unwrap();
+        match id {
+            HardwareStoppoint::Breakpoint(id) => {
+                println!(" (breakpoint {})", id);
+            },
+            HardwareStoppoint::Watchpoint(id) => {
+                let point = process.watchpoint_sites.get_by_id_mut(id).unwrap();
+                println!(" (watchpoint {})", id);
+                if point.data == point.previos_data {
+                    println!("Value: {:x}", point.data)
+                } else {
+                    println!("Value: {:x}", point.previos_data);
+                    println!("New value: {:x}", point.data);
+                }
+            },
+        }
+    }
+
+    if reason.trap_reason == Some(TrapType::SingleStep) {
+        println!(" (single step)");
+    }
+}
+
 static NEXT_BREAKPOINT_ID: AtomicI32 = AtomicI32::new(1);
 static NEXT_WATCHPOINT_ID: AtomicI32 = AtomicI32::new(1);
+
+pub enum HardwareStoppoint {
+    Breakpoint(i32), // BreakpointSite::Id
+    Watchpoint(i32), // Watchpoint::Id
+}
 
 impl Drop for Process {
     fn drop(&mut self) {
@@ -209,24 +258,58 @@ impl Process {
                 let reason = match wait_status {
                     WaitStatus::Exited(_pid, status) => {
                         self.status = Some(Pstatus::Exited);
-                        Ok(StopReason { reason: Pstatus::Exited, status: status as u8, signal: "".to_string() })
+                        Ok(StopReason {
+                            reason: Pstatus::Exited,
+                            status: Some(status as u8),
+                            signal: None,
+                            trap_reason: None,
+                        })
                     },
                     WaitStatus::Signaled(_pid, signal, _) => {
                         self.status = Some(Pstatus::Terminated);
-                        Ok(StopReason { reason: Pstatus::Terminated, status: 0, signal: signal.to_string() })
+                        Ok(StopReason {
+                            reason: Pstatus::Terminated,
+                            status: None,
+                            signal: Some(signal),
+                            trap_reason: None,
+                        })
                     },
                     WaitStatus::Stopped(_pid, signal) => {
                         self.status = Some(Pstatus::Stopped);
+                        let mut reason = StopReason {
+                            reason: Pstatus::Stopped,
+                            status: None,
+                            signal: Some(signal),
+                            trap_reason: None,
+                        };
                         if self.is_attached == true {
                             self.read_all_registers()?;
+                            self.augment_stop_reason(&mut reason)?;
 
                             let instr_begin = self.get_pc()? - 1;
                             let is_sigtrap = signal == SIGTRAP;
-                            if is_sigtrap && self.breakpoint_sites.enabled_stoppoint_at_address(instr_begin) {
-                                self.set_pc(instr_begin)?;
-                            }
+                            if reason.trap_reason == Some(TrapType::SoftwareBreak) &&
+                                is_sigtrap && self.breakpoint_sites.enabled_stoppoint_at_address(instr_begin) {
+                                    self.set_pc(instr_begin)?;
+                                } else if reason.trap_reason == Some(TrapType::HardwareBreak) {
+                                    let id = self.get_current_hardware_stoppoint()?;
+
+                                    match id {
+                                        HardwareStoppoint::Breakpoint(_) => {}
+                                        HardwareStoppoint::Watchpoint(id) => {
+                                            let (address, size) = {
+                                                let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
+                                                (watchpoint.address(), watchpoint.size)
+                                            };
+
+                                            let memory = self.read_memory(address, size)?;
+                                            let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
+                                            watchpoint.update_data(&memory);
+                                        }
+                                    }
+                                }
                         }
-                        Ok(StopReason { reason: Pstatus::Stopped, status: 0, signal: signal.to_string() })
+                        Ok(reason)
                     },
                     _ => bail!("Process is not stopped: {}", self.pid),
                 };
@@ -235,7 +318,6 @@ impl Process {
             Err(e) => bail!("waitpid failed {}", e),
         }
     }
-
     pub fn read_all_registers(&mut self) -> Result<()> {
         match getregs(self.pid) {
             Ok(r) => {
@@ -346,6 +428,8 @@ impl Process {
             hardware_register_index: -1,
             mode,
             size,
+            data: 0,
+            previos_data: 0,
         };
 
         self.watchpoint_sites.stoppoints.push(watchpoint);
@@ -540,6 +624,78 @@ impl Process {
         }
 
         result
+    }
+
+    pub fn augment_stop_reason(&self, reason: &mut StopReason) -> Result<()> {
+        let mut info: siginfo_t = unsafe { std::mem::zeroed() };
+
+        let ret = unsafe {
+            ptrace(
+                PTRACE_GETSIGINFO,
+                self.pid.as_raw(),
+                std::ptr::null_mut::<c_void>(),
+                &mut info as *mut _ as *mut c_void,
+            )
+        };
+
+        if ret == -1 {
+            let err = std::io::Error::last_os_error();
+            bail!("Failed to get signal info: {}", err);
+        }
+
+        reason.trap_reason = None;
+
+        if reason.signal == Some(SIGTRAP) {
+            reason.trap_reason = match info.si_code {
+                TRAP_TRACE => Some(TrapType::SingleStep),
+                SI_KERNEL => Some(TrapType::SoftwareBreak),
+                TRAP_HWBKPT => Some(TrapType::HardwareBreak),
+                _ => None,
+            };
+        }
+
+        Ok(())
+    }
+
+    pub fn get_current_hardware_stoppoint(&mut self) -> Result<HardwareStoppoint> {
+        // Read DR6 (debug status register)
+        let dr6_info = register_info_by_id(RegisterId::DR6);
+        let status_val = match self.registers.read(dr6_info) {
+            RegisterValue::U64(val) => val,
+            other => bail!("Unexpected value in DR6: {:?}", other),
+        };
+
+        // If no bits set, no hardware stoppoint triggered
+        if status_val == 0 {
+            bail!("No hardware stoppoint triggered");
+        }
+
+        // Find lowest set bit index (corresponds to DRx triggered)
+        let index = status_val.trailing_zeros() as usize;
+        if index >= DEBUG_REG_IDS.len() {
+            bail!("Invalid DRx index from DR6 status: {}", index);
+        }
+
+        // Read the corresponding DRx address register
+        let dr_id = DEBUG_REG_IDS[index].clone();
+        let dr_info = register_info_by_id(dr_id);
+        let addr_val = match self.registers.read(dr_info) {
+            RegisterValue::U64(val) => val,
+            other => bail!("Unexpected value in DRx: {:?}", other),
+        };
+
+        let addr = VirtAddr(addr_val);
+
+        // Check if this address corresponds to a breakpoint site
+        if self.breakpoint_sites.contains_address(addr) {
+            let site_id = self.breakpoint_sites.get_by_address_mut(addr).unwrap().id();
+            Ok(HardwareStoppoint::Breakpoint(site_id))
+        } else if self.watchpoint_sites.contains_address(addr) {
+            let watch_id = self.watchpoint_sites.get_by_address_mut(addr).unwrap().id();
+            Ok(HardwareStoppoint::Watchpoint(watch_id))
+        } else {
+            bail!("Address at DR{} not recognized as breakpoint or watchpoint", index);
+        }
     }
 }
 
