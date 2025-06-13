@@ -17,7 +17,7 @@ $ cargo run -- -p 1247
 ```
 Type `help` for usage:
 
-```sh
+```
 rdb> help
 Available commands:
     breakpoint  - Commands for operating on breakpoints
