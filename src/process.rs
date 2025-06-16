@@ -118,7 +118,7 @@ fn get_sigtrap_info(target: &mut Target, reason: &StopReason) {
                 let mangled = target.elf.get_string(func.st_name as usize);
                 let demangled = demangle(mangled).to_string();
                 let demangled_simple = extract_func_name(&demangled).unwrap_or("");
-                println!("unmangled func name: {}", demangled_simple);
+                println!("demangled func name: {}", demangled_simple);
             }
         }
     }
