@@ -1,39 +1,7 @@
-use std::ops::{Add, AddAssign, Sub, SubAssign};
 use anyhow::Result;
 use nix::unistd::Pid;
 
-use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct VirtAddr(pub u64);
-
-impl Add<i64> for VirtAddr  {
-    type Output = Self;
-
-    fn add(self, offset: i64) -> Self {
-        VirtAddr((self.0 as i64 + offset) as u64)
-    }
-}
-
-impl Sub<i64> for VirtAddr  {
-    type Output = Self;
-
-    fn sub(self, offset: i64) -> Self {
-        VirtAddr((self.0 as i64 - offset) as u64)
-    }
-}
-
-impl AddAssign<i64> for VirtAddr {
-    fn add_assign(&mut self, offset: i64) {
-        self.0 = (self.0 as i64 + offset) as u64;
-    }
-}
-
-impl SubAssign<i64> for VirtAddr {
-    fn sub_assign(&mut self, offset: i64) {
-        self.0 = (self.0 as i64 - offset) as u64;
-    }
-}
+use crate::{registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS}, types::VirtAddr};
 
 #[derive(Clone, Debug)]
 pub enum StoppointMode {

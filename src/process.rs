@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::os::fd::{FromRawFd, IntoRawFd};
+use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use nix::fcntl::OFlag;
 use nix::sys::signal::Signal::SIGTRAP;
+use rustc_demangle::demangle;
 use sysnames::Syscalls;
 use std::os::unix::io::RawFd;
 use anyhow::{bail, Context, Result};
@@ -19,14 +22,17 @@ use std::{mem, ptr};
 use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
 
 use crate::breakpoints::BreakpointSite;
+use crate::elf::{elf64_st_type, STT_FUNC};
 use crate::syscall::{CatchPolicyMode, SyscallCatchPolicy, SyscallData, SyscallInformation};
 use crate::print_disassembly;
 use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
-use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
+use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode};
+use crate::target::Target;
+use crate::types::VirtAddr;
 use crate::utils::FromBytes;
 use crate::watchpoint::Watchpoint;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Pstatus {
     Stopped,
     Running,
@@ -50,7 +56,6 @@ pub enum TrapType {
     Syscall,
 }
 
-#[derive(Clone)]
 pub struct Process {
     pub pid: Pid,
     pub status: Option<Pstatus>,
@@ -69,16 +74,19 @@ pub struct Instruction {
     pub text: String,
 }
 
-pub fn handle_stop(process: &mut Process, reason: StopReason) {
-    let rip = process.get_pc().unwrap().0;
+pub fn handle_stop(target: &mut Target, reason: StopReason) {
+    let rip = {
+        let process = &mut target.process;
+        process.get_pc().unwrap().0
+    };
 
-    println!("Process {} stopped at address 0x{:x}", process.pid, rip);
+    println!("Process {} stopped at address 0x{:x}", target.process.pid, rip);
 
     match reason.reason {
         Pstatus::Stopped => {
             println!("stopped with signal {}", reason.signal.unwrap().to_string());
             if reason.signal == Some(SIGTRAP) {
-                get_sigtrap_info(process, &reason);
+                get_sigtrap_info(target, &reason);
             }
         }
         Pstatus::Running => panic!("unreachable handle_stop"),
@@ -87,11 +95,34 @@ pub fn handle_stop(process: &mut Process, reason: StopReason) {
     }
 
     if reason.reason == Pstatus::Stopped {
-        print_disassembly(&process, VirtAddr(rip), 5);
+        let process = &mut target.process;
+        print_disassembly(process, VirtAddr(rip), 5);
     }
 }
 
-fn get_sigtrap_info(process: &mut Process, reason: &StopReason) {
+fn extract_func_name(s: &str) -> Option<&str> {
+    let parts: Vec<&str> = s.split("::").collect();
+    if parts.len() == 3 {
+        Some(parts[1])
+    } else {
+        None
+    }
+}
+
+fn get_sigtrap_info(target: &mut Target, reason: &StopReason) {
+    let process = &mut target.process;
+
+    if let Ok(pc) = process.get_pc() {
+        if let Some(func) = target.elf.get_symbol_containing_address_virt(pc) {
+            if elf64_st_type(func.st_info) == STT_FUNC {
+                let mangled = target.elf.get_string(func.st_name as usize);
+                let demangled = demangle(mangled).to_string();
+                let demangled_simple = extract_func_name(&demangled).unwrap_or("");
+                println!("unmangled func name: {}", demangled_simple);
+            }
+        }
+    }
+
     if reason.trap_reason == Some(TrapType::SoftwareBreak) {
         let pc = process.get_pc().unwrap();
         let site = process.breakpoint_sites.get_by_address_mut(pc).unwrap();
@@ -811,6 +842,28 @@ impl Process {
         }
 
         Ok(reason)
+    }
+
+    pub fn get_auxv(&self) -> Result<HashMap<u64, u64>> {
+        let path = format!("/proc/{}/auxv", self.pid);
+        let mut file = File::open(Path::new(&path))?;
+
+        let mut ret = HashMap::new();
+        let mut buf = [0u8; 16]; // 2 x u64 = 16 bytes
+
+        while file.read_exact(&mut buf).is_ok() {
+            let id = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+            let value = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+
+            const AT_NULL: u64 = 0;
+            if id == AT_NULL {
+                break;
+            }
+
+            ret.insert(id, value);
+        }
+
+        Ok(ret)
     }
 }
 

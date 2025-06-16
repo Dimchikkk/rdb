@@ -1,13 +1,15 @@
-use std::{marker::PhantomData, sync::{LazyLock, Mutex}};
+use std::sync::{LazyLock, Mutex};
 
 use process::{handle_stop, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
-use registers::{register_info_by_name, write_register, RegisterType, UserRegisters, REGISTERS};
+use registers::{register_info_by_name, write_register, RegisterType, REGISTERS};
 use registers_io::{format_register_value, parse_register_value};
-use stoppoint::{Stoppoint, StoppointCollection, StoppointMode, VirtAddr};
+use stoppoint::{Stoppoint, StoppointMode};
 use syscall::SyscallCatchPolicy;
 use sysnames::Syscalls;
+use target::Target;
+use types::VirtAddr;
 use utils::{parse_vector, print_hex_dump};
 use nix::{sys::signal::{kill, SigHandler, Signal::{self, SIGINT}}, unistd::Pid};
 use nix::sys::signal::signal;
@@ -20,12 +22,15 @@ mod watchpoint;
 mod stoppoint;
 mod registers;
 mod registers_io;
+mod elf;
+mod types;
+mod target;
 
-static G_RDB_PROCESS: LazyLock<Mutex<Option<Process>>> = LazyLock::new(|| Mutex::new(None));
+static G_RDB_PID: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
 
 extern "C" fn handle_sigint(_sig: i32) {
-    if let Some(process) = G_RDB_PROCESS.lock().unwrap().as_ref() {
-        let _ = kill(process.pid, Signal::SIGSTOP);
+    if let Some(pid) = *G_RDB_PID.lock().unwrap() {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGSTOP);
     }
 }
 
@@ -39,34 +44,20 @@ fn main() -> Result<()> {
     if args.len() == 3 && args.nth(1).unwrap() == "-p" {
         let pid_str = args.nth(0).unwrap();
         let pid_num = pid_str.parse::<i32>().expect("PID should be a number");
-        let pid = Pid::from_raw(pid_num);
-        let user_registers = UserRegisters::new();
-        let mut process = Process {
-            pid,
-            status: None,
-            terminate_on_end: false,
-            is_attached: true,
-            registers: user_registers,
-            breakpoint_sites: StoppointCollection::new(),
-            watchpoint_sites: StoppointCollection::new(),
-            syscall_catch_policy: SyscallCatchPolicy::catch_none(),
-            expecting_syscall_exit: false,
-            _not_send_or_sync: PhantomData,
-        };
-        process.attach()?;
-        main_loop(&mut process)?;
+        let mut target = Target::attach(pid_num)?;
+        main_loop(&mut target)?;
     } else {
         let program_path = args.nth(1).unwrap();
-        let mut process = Process::launch(program_path)?;
-        main_loop(&mut process)?;
+        let mut target = Target::launch(program_path.into())?;
+        main_loop(&mut target)?;
     }
     Ok(())
 }
 
-fn main_loop(process: &mut Process) -> Result<()> {
+fn main_loop(target: &mut Target) -> Result<()> {
     {
-        let mut global = G_RDB_PROCESS.lock().unwrap();
-        *global = Some(process.clone());
+        let mut global_pid = G_RDB_PID.lock().unwrap();
+        *global_pid = Some(target.process.pid.as_raw());
     }
 
     unsafe {
@@ -74,38 +65,62 @@ fn main_loop(process: &mut Process) -> Result<()> {
     }
 
     let mut cl = Copperline::new();
+
     while let Ok(line) = cl.read_line("rdb> ", copperline::Encoding::Utf8) {
-        if !line.trim().is_empty() {
-            let args: Vec<&str> = line.split_whitespace().collect();
-            let command = args[0];
-
-            if command.starts_with("catch") {
-                handle_catchpoint_command(process, &args)?;
-            } else if command.starts_with("c") {
-                process.resume()?;
-                let reason = process.wait_on_signal().unwrap();
-                handle_stop(process, reason);
-            } else if command.starts_with("reg") {
-                handle_register_command(process, &args);
-            } else if command.starts_with("b") {
-                handle_breakpoint_command(process, &args)?;
-            } else if command.starts_with("s") {
-                let reason = process.step_instruction()?;
-                handle_stop(process, reason);
-            } else if command.starts_with("mem") {
-                handle_memory_command(process, &args)?;
-            } else if command.starts_with("dis") {
-                handle_disassemble_command(process, &args);
-            } else if command.starts_with("watch") {
-                handle_watchpoint_command(process, &args)?;
-            } else if command.starts_with("help") {
-                print_help(&args);
-            } else {
-                println!("Unknown command");
-            }
-
-            cl.add_history(line);
+        if line.trim().is_empty() {
+            continue;
         }
+
+        let args: Vec<&str> = line.split_whitespace().collect();
+        let command = args[0];
+
+         match command {
+            cmd if cmd.starts_with("catch") => {
+                let process = &mut target.process;
+                handle_catchpoint_command(process, &args)?;
+            }
+            cmd if cmd.starts_with("c") => {
+                let reason = {
+                    let process = &mut target.process;
+                    process.resume()?;
+                    process.wait_on_signal().unwrap()
+                };
+                handle_stop(target, reason);
+            }
+            cmd if cmd.starts_with("reg") => {
+                let process = &mut target.process;
+                handle_register_command(process, &args);
+            }
+            cmd if cmd.starts_with("b") => {
+                let process = &mut target.process;
+                handle_breakpoint_command(process, &args)?;
+            }
+            cmd if cmd.starts_with("s") => {
+                let reason = {
+                    let process = &mut target.process;
+                    process.step_instruction()?
+                };
+                handle_stop(target, reason);
+            }
+            cmd if cmd.starts_with("mem") => {
+                let process = &mut target.process;
+                handle_memory_command(process, &args)?;
+            }
+            cmd if cmd.starts_with("dis") => {
+                let process = &mut target.process;
+                handle_disassemble_command(process, &args);
+            }
+            cmd if cmd.starts_with("watch") => {
+                let process = &mut target.process;
+                handle_watchpoint_command(process, &args)?;
+            }
+            cmd if cmd.starts_with("help") => {
+                print_help(&args);
+            }
+            _ => println!("Unknown command"),
+        }
+
+        cl.add_history(line);
     }
 
     Ok(())

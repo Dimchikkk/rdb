@@ -1,7 +1,7 @@
 use nix::unistd::Pid;
 use anyhow::Result;
 
-use crate::stoppoint::{Stoppoint, StoppointMode, VirtAddr};
+use crate::{stoppoint::{Stoppoint, StoppointMode}, types::VirtAddr};
 
 #[derive(Clone)]
 pub struct Watchpoint {

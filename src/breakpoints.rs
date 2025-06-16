@@ -4,7 +4,7 @@ use libc::{ptrace, c_void};
 use std::ptr;
 use std::io::Error;
 
-use crate::{registers::UserRegisters, stoppoint::{Stoppoint, StoppointMode, VirtAddr}};
+use crate::{registers::UserRegisters, stoppoint::{Stoppoint, StoppointMode}, types::VirtAddr};
 
 #[derive(Clone)]
 pub struct BreakpointSite {
@@ -139,4 +139,3 @@ impl Stoppoint for BreakpointSite {
     }
 
 }
-
