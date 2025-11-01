@@ -72,7 +72,7 @@ rdb> break list
 
 ```bash
 # Compile with debug info
-$ rustc -g -C opt-level=0 example.rs
+$ rustc -g example.rs
 
 # Launch debugger
 $ ./target/release/rdb ./example
@@ -91,7 +91,7 @@ rdb> cont              # Continue
 
 Compile the demo program:
 ```bash
-rustc -g -C opt-level=0 test_programs/demo.rs -o target/test_bins/demo
+rustc -g test_programs/demo.rs -o target/test_bins/demo
 ```
 
 Launch and test:
@@ -153,17 +153,10 @@ cargo test -- --nocapture
 cargo test --test breakpoints
 ```
 
-All tests passing:
-- ✅ `source_level_breakpoints`
-- ✅ `stepping_behaviour`
-- ✅ `test_debugger_demo`
-- ✅ `test_comprehensive_stepping`
-
 ## Requirements
 
 - Linux x86_64
 - Programs must be compiled with debug info (`-g`)
-- Disable optimizations for best results (`-C opt-level=0`)
 
 ## License
 
