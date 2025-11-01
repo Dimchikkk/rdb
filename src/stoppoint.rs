@@ -1,7 +1,13 @@
 use anyhow::Result;
 use nix::unistd::Pid;
 
-use crate::{registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS}, types::VirtAddr};
+use crate::{
+    registers::{
+        register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters,
+        DEBUG_REG_IDS,
+    },
+    types::VirtAddr,
+};
 
 #[derive(Clone, Debug)]
 pub enum StoppointMode {
@@ -72,7 +78,12 @@ pub trait Stoppoint {
         // Write the address into DRx
         let dr_id = DEBUG_REG_IDS[free_index].clone();
         let dr_info = register_info_by_id(dr_id);
-        write_register(self.pid(), registers, dr_info, RegisterValue::U64(address.0));
+        write_register(
+            self.pid(),
+            registers,
+            dr_info,
+            RegisterValue::U64(address.0),
+        );
 
         let mode_flag = encode_hardware_stoppoint_mode(mode);
         let size_flag = encode_hardware_stoppoint_size(size);
@@ -127,8 +138,16 @@ impl<T: Stoppoint> StoppointCollection<T> {
         self.stoppoints.iter_mut().find(|sp| sp.id() == id)
     }
 
+    pub fn get_by_id(&self, id: T::Id) -> Option<&T> {
+        self.stoppoints.iter().find(|sp| sp.id() == id)
+    }
+
     pub fn get_by_address_mut(&mut self, addr: VirtAddr) -> Option<&mut T> {
         self.stoppoints.iter_mut().find(|sp| sp.at_address(addr))
+    }
+
+    pub fn get_by_address(&self, addr: VirtAddr) -> Option<&T> {
+        self.stoppoints.iter().find(|sp| sp.at_address(addr))
     }
 
     pub fn remove_by_id(&mut self, registers: &mut UserRegisters, id: T::Id) -> Result<()> {
@@ -139,7 +158,11 @@ impl<T: Stoppoint> StoppointCollection<T> {
         Ok(())
     }
 
-    pub fn remove_by_address(&mut self, registers: &mut UserRegisters, addr: VirtAddr) -> Result<()>{
+    pub fn remove_by_address(
+        &mut self,
+        registers: &mut UserRegisters,
+        addr: VirtAddr,
+    ) -> Result<()> {
         if let Some(pos) = self.stoppoints.iter().position(|sp| sp.at_address(addr)) {
             self.stoppoints[pos].disable(registers)?;
             self.stoppoints.remove(pos);
@@ -158,9 +181,9 @@ impl<T: Stoppoint> StoppointCollection<T> {
 /// Encode the breakpoint/watchpoint mode into the 2-bit DR7 flags.
 pub fn encode_hardware_stoppoint_mode(mode: StoppointMode) -> u64 {
     match mode {
-        StoppointMode::Write     => 0b01,
+        StoppointMode::Write => 0b01,
         StoppointMode::ReadWrite => 0b11,
-        StoppointMode::Execute   => 0b00,
+        StoppointMode::Execute => 0b00,
     }
 }
 

@@ -1,30 +1,26 @@
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
-use process::{handle_stop, Process};
 use anyhow::{bail, Result};
 use copperline::Copperline;
-use registers::{register_info_by_name, write_register, RegisterType, REGISTERS};
-use registers_io::{format_register_value, parse_register_value};
-use stoppoint::{Stoppoint, StoppointMode};
-use syscall::SyscallCatchPolicy;
-use sysnames::Syscalls;
-use target::Target;
-use types::VirtAddr;
-use utils::{parse_vector, print_hex_dump};
-use nix::{sys::signal::{kill, SigHandler, Signal::{self, SIGINT}}, unistd::Pid};
 use nix::sys::signal::signal;
-
-mod utils;
-mod process;
-mod breakpoints;
-mod syscall;
-mod watchpoint;
-mod stoppoint;
-mod registers;
-mod registers_io;
-mod elf;
-mod types;
-mod target;
+use nix::{
+    sys::signal::{
+        kill, SigHandler,
+        Signal::{self, SIGINT},
+    },
+    unistd::Pid,
+};
+use rdb::breakpoint::BreakpointKind;
+use rdb::process::{handle_stop, Process};
+use rdb::registers::{register_info_by_name, write_register, RegisterType, REGISTERS};
+use rdb::registers_io::{format_register_value, parse_register_value};
+use rdb::stoppoint::{Stoppoint, StoppointMode};
+use rdb::syscall::SyscallCatchPolicy;
+use rdb::target::Target;
+use rdb::types::VirtAddr;
+use rdb::utils::{parse_vector, print_disassembly, print_hex_dump};
+use sysnames::Syscalls;
 
 static G_RDB_PID: LazyLock<Mutex<Option<i32>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -74,33 +70,41 @@ fn main_loop(target: &mut Target) -> Result<()> {
         let args: Vec<&str> = line.split_whitespace().collect();
         let command = args[0];
 
-         match command {
+        match command {
             cmd if cmd.starts_with("catch") => {
                 let process = &mut target.process;
                 handle_catchpoint_command(process, &args)?;
             }
-            cmd if cmd.starts_with("c") => {
-                let reason = {
-                    let process = &mut target.process;
-                    process.resume()?;
-                    process.wait_on_signal().unwrap()
-                };
-                handle_stop(target, reason);
+            cmd if cmd.starts_with("cont") || cmd == "c" => {
+                target.process.resume()?;
+                let reason = target.process.wait_on_signal()?;
+                handle_stop(target, &reason);
             }
             cmd if cmd.starts_with("reg") => {
                 let process = &mut target.process;
                 handle_register_command(process, &args);
             }
-            cmd if cmd.starts_with("b") => {
-                let process = &mut target.process;
-                handle_breakpoint_command(process, &args)?;
+            cmd if cmd.starts_with("break") || cmd == "b" => {
+                handle_breakpoint_command(target, &args)?;
             }
-            cmd if cmd.starts_with("s") => {
+            cmd if cmd.starts_with("next") || cmd == "n" => {
+                let reason = target.step_over()?;
+                handle_stop(target, &reason);
+            }
+            cmd if cmd.starts_with("finish") => {
+                let reason = target.step_out()?;
+                handle_stop(target, &reason);
+            }
+            cmd if cmd.starts_with("stepi") => {
                 let reason = {
                     let process = &mut target.process;
                     process.step_instruction()?
                 };
-                handle_stop(target, reason);
+                handle_stop(target, &reason);
+            }
+            cmd if cmd.starts_with("step") || cmd == "s" => {
+                let reason = target.step_in()?;
+                handle_stop(target, &reason);
             }
             cmd if cmd.starts_with("mem") => {
                 let process = &mut target.process;
@@ -259,7 +263,9 @@ fn handle_watchpoint_command(process: &mut Process, args: &[&str]) -> Result<()>
             }
         }
         "delete" => {
-            process.watchpoint_sites.remove_by_id(&mut process.registers, id)?;
+            process
+                .watchpoint_sites
+                .remove_by_id(&mut process.registers, id)?;
         }
         _ => {
             print_help(&["help", "watch"]);
@@ -328,8 +334,8 @@ fn handle_memory_write_command(process: &mut Process, args: &[&str]) -> Result<(
     }
 
     let addr_str = args[2].strip_prefix("0x").unwrap_or(args[2]);
-    let address = u64::from_str_radix(addr_str, 16)
-        .map_err(|_| anyhow::anyhow!("Invalid address format"))?;
+    let address =
+        u64::from_str_radix(addr_str, 16).map_err(|_| anyhow::anyhow!("Invalid address format"))?;
 
     // Join all the rest args (bytes) into one string to parse
     let bytes_str = args[3..].join(" ");
@@ -375,70 +381,164 @@ fn handle_memory_read_command(process: &Process, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn handle_breakpoint_command(process: &mut Process, args: &[&str]) -> Result<()> {
-    let command = args[1];
-
-    if command.starts_with("list") {
-        if process.breakpoint_sites.stoppoints.is_empty() {
-            println!("No breakpoints set");
-        } else {
-            println!("Current breakpoints:");
-            for site in &process.breakpoint_sites.stoppoints {
-                if site.is_internal {
-                    continue;
-                }
-                println!(
-                    "{}: address = {:#x}, {}",
-                    site.id,
-                    site.address.0,
-                    if site.is_enabled { "enabled" } else { "disabled" }
-                );
-            }
-        }
+fn handle_breakpoint_command(target: &mut Target, args: &[&str]) -> Result<()> {
+    if args.len() < 2 {
+        print_help(&["help", "break"]);
         return Ok(());
     }
 
-    if command.starts_with("set") {
-        let addr_str = args[2];
-        let addr_trimmed = addr_str.strip_prefix("0x").unwrap_or(addr_str);
-
-        let address = match u64::from_str_radix(addr_trimmed, 16) {
-            Ok(addr) => addr,
-            Err(_) => {
-                eprintln!("Breakpoint command expects address in hexadecimal, prefixed with '0x'");
+    match args[1] {
+        cmd if cmd.starts_with("list") => {
+            if target.breakpoints.is_empty() {
+                println!("No breakpoints set");
                 return Ok(());
             }
-        };
 
-        let is_hardware = args.len() == 4 && args[3] == "-h";
-        println!("hardware: {}", is_hardware);
-        return process.create_breakpoint_site(VirtAddr(address), is_hardware);
-    }
+            println!("Current breakpoints:");
+            for bp in target.breakpoints.iter() {
+                print!("{}: ", bp.id());
+                match bp.kind() {
+                    BreakpointKind::Address { address } => {
+                        print!("address = {:#x}", address.0);
+                    }
+                    BreakpointKind::Function { name } => {
+                        print!("function = {}", name);
+                    }
+                    BreakpointKind::Line { file, line } => {
+                        print!("file = {}, line = {}", file.display(), line);
+                    }
+                }
+                println!(
+                    ", {}",
+                    if bp.is_enabled() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
 
-    let id = match args[2].parse::<i32>() {
-        Ok(id) => id,
-        Err(_) => {
-            eprintln!("Command expects breakpoint id");
-            return Ok(());
+                for site_id in bp.sites() {
+                    if let Some(site) = target.process.breakpoint_sites.get_by_id(*site_id) {
+                        println!(
+                            "    .{}: address = {:#x}, {}",
+                            site.id(),
+                            site.address().0,
+                            if site.is_enabled() {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        );
+                    }
+                }
+            }
         }
-    };
+        cmd if cmd.starts_with("set") => {
+            if args.len() < 3 {
+                eprintln!("Usage: break set <address|function|file:line> [-h]");
+                return Ok(());
+            }
 
-    if command.starts_with("enable") {
-        if let Some(site) = process.breakpoint_sites.get_by_id_mut(id) {
-            site.enable(&mut process.registers)?;
-        } else {
-            eprintln!("No breakpoint with id {}", id);
+            let mut hardware = false;
+            let spec = args[2];
+            if args.len() >= 4 {
+                if args[3] == "-h" {
+                    hardware = true;
+                } else {
+                    eprintln!("Unknown breakpoint option: {}", args[3]);
+                    return Ok(());
+                }
+            }
+
+            let breakpoint_result = if spec.starts_with("0x") {
+                let addr_trimmed = spec.trim_start_matches("0x");
+                match u64::from_str_radix(addr_trimmed, 16) {
+                    Ok(addr) => target.create_address_breakpoint(VirtAddr(addr), hardware),
+                    Err(_) => {
+                        eprintln!("Invalid address format");
+                        return Ok(());
+                    }
+                }
+            } else if let Some((file, line_str)) = spec.split_once(':') {
+                match line_str.parse::<u64>() {
+                    Ok(line) => target.create_line_breakpoint(PathBuf::from(file), line, hardware),
+                    Err(_) => {
+                        eprintln!("Line number should be an integer");
+                        return Ok(());
+                    }
+                }
+            } else {
+                target.create_function_breakpoint(spec.to_string(), hardware)
+            };
+
+            let bp_id = {
+                match breakpoint_result {
+                    Ok(bp) => bp.id(),
+                    Err(err) => {
+                        eprintln!("Failed to set breakpoint: {err}");
+                        return Ok(());
+                    }
+                }
+            };
+
+            {
+                let process = &mut target.process;
+                let elf = &target.elf;
+                if let Some(bp) = target.breakpoints.get_by_id_mut(bp_id) {
+                    bp.enable(process, elf)?;
+                }
+            }
+
+            println!("Breakpoint {} set", bp_id);
         }
-    } else if command.starts_with("disable") {
-        if let Some(site) = process.breakpoint_sites.get_by_id_mut(id) {
-            site.disable(&mut process.registers)?;
-        } else {
-            eprintln!("No breakpoint with id {}", id);
+        cmd if cmd.starts_with("enable") || cmd.starts_with("disable") => {
+            if args.len() < 3 {
+                eprintln!("Command expects breakpoint id");
+                return Ok(());
+            }
+            let id = match args[2].parse::<i32>() {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("Invalid breakpoint id");
+                    return Ok(());
+                }
+            };
+
+            let process = &mut target.process;
+            let elf = &target.elf;
+            if let Some(bp) = target.breakpoints.get_by_id_mut(id) {
+                if cmd.starts_with("enable") {
+                    bp.enable(process, elf)?;
+                } else {
+                    bp.disable(process)?;
+                }
+            } else {
+                eprintln!("No breakpoint with id {}", id);
+            }
         }
-    } else if command.starts_with("delete") {
-        process.breakpoint_sites.remove_by_id(&mut process.registers, id)?;
-    } else {
-        print_help(&["help", "break"]);
+        cmd if cmd.starts_with("delete") => {
+            if args.len() < 3 {
+                eprintln!("Command expects breakpoint id");
+                return Ok(());
+            }
+            let id = match args[2].parse::<i32>() {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!("Invalid breakpoint id");
+                    return Ok(());
+                }
+            };
+
+            if let Some(mut bp) = target.breakpoints.remove_by_id(id) {
+                bp.remove_sites(&mut target.process)?;
+                println!("Deleted breakpoint {}", id);
+            } else {
+                eprintln!("No breakpoint with id {}", id);
+            }
+        }
+        _ => {
+            print_help(&["help", "break"]);
+        }
     }
 
     Ok(())
@@ -483,7 +583,7 @@ pub fn handle_register_read(process: &Process, args: &[&str]) {
             }
         }
     } else {
-         print_help(&["help", "reg"]);
+        print_help(&["help", "reg"]);
     }
 }
 
@@ -507,22 +607,18 @@ fn handle_register_write(process: &mut Process, args: &[&str]) {
     write_register(process.pid, &mut process.registers, info, value);
 }
 
-fn print_disassembly(process: &Process, address: VirtAddr, n_instructions: usize) {
-    let instructions = process.disassemble(n_instructions, Some(address));
-    for instr in instructions {
-        println!("{:#018x}: {}", instr.address.0, instr.text);
-    }
-}
-
 fn print_help(args: &[&str]) {
     match args {
         ["help"] => {
             println!("Available commands:");
             println!("    break - Commands for operating on breakpoints");
             println!("    c     - Resume the process");
+            println!("    next  - Step over the current line");
+            println!("    finish- Step out of the current function");
+            println!("    step  - Step into the next source line");
+            println!("    stepi - Step a single instruction");
             println!("    dis   - Disassemble instructions from memory");
             println!("    reg   - Commands for operating on registers");
-            println!("    step  - Step over a single instruction");
             println!("    catch - Catch syscalls");
             println!("    mem   - Read/write memory");
         }
@@ -533,7 +629,9 @@ fn print_help(args: &[&str]) {
             println!("    disable <id>");
             println!("    enable <id>");
             println!("    set <address>");
-            println!("    set <address> -h");
+            println!("    set <function>");
+            println!("    set <file>:<line>");
+            println!("    set <spec> -h");
         }
         ["help", cmd] if cmd.starts_with("catch") => {
             println!("Available catchpoint commands:");

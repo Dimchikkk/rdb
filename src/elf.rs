@@ -1,15 +1,16 @@
+use anyhow::{bail, Result};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::mem;
-use std::path::Path;
-use std::collections::{HashMap, BTreeMap};
-use std::path::PathBuf;
-use anyhow::{bail, Result};
 use std::ops::Bound::{Included, Unbounded};
+use std::path::Path;
+use std::path::PathBuf;
 
 use memmap2::Mmap;
 use nix::libc::{Elf64_Ehdr, Elf64_Shdr, Elf64_Sym};
 use rustc_demangle::demangle;
 
+use crate::dwarf::Dwarf;
 use crate::types::{FileAddr, VirtAddr};
 
 pub struct Elf {
@@ -34,6 +35,9 @@ pub struct Elf {
     pub symbol_name_map: HashMap<String, Vec<*const Elf64_Sym>>,
     // Map from [start,end) range -> symbol pointer
     pub symbol_addr_map: BTreeMap<(FileAddr, FileAddr), *const Elf64_Sym>,
+
+    // DWARF debugging information
+    pub dwarf_data: Option<Box<Dwarf>>,
 }
 
 /// Extract the symbol type from st_info (lower 4 bits)
@@ -41,7 +45,6 @@ pub struct Elf {
 pub fn elf64_st_type(st_info: u8) -> u8 {
     st_info & 0xf
 }
-
 
 pub const STT_TLS: u8 = 6;
 pub const STT_FUNC: u8 = 2;
@@ -95,6 +98,7 @@ impl Elf {
             symbol_table: Vec::new(),
             symbol_name_map: HashMap::new(),
             symbol_addr_map: BTreeMap::new(),
+            dwarf_data: None,
         })
     }
 
@@ -103,6 +107,7 @@ impl Elf {
         self.build_section_map()?;
         self.parse_symbol_table()?;
         self.build_symbol_maps()?;
+        self.dwarf_data = Some(Dwarf::new(self)?);
         Ok(())
     }
 
@@ -150,9 +155,7 @@ impl Elf {
 
         if count == 0 && entsize != 0 {
             // ELF Extension: section header count stored in sh_size of first header
-            let first_header_ptr = unsafe {
-                self.data_ptr.add(shoff) as *const Elf64_Shdr
-            };
+            let first_header_ptr = unsafe { self.data_ptr.add(shoff) as *const Elf64_Shdr };
 
             if first_header_ptr.is_null() {
                 bail!("Invalid section header offset");
@@ -168,12 +171,8 @@ impl Elf {
         }
 
         let section_data_start = unsafe { self.data_ptr.add(shoff) };
-        let section_slice = unsafe {
-            std::slice::from_raw_parts(
-                section_data_start as *const Elf64_Shdr,
-                count,
-            )
-        };
+        let section_slice =
+            unsafe { std::slice::from_raw_parts(section_data_start as *const Elf64_Shdr, count) };
 
         self.section_headers = section_slice.to_vec();
         Ok(())
@@ -205,21 +204,22 @@ impl Elf {
     pub fn build_section_map(&mut self) -> Result<()> {
         for (i, section) in self.section_headers.iter().enumerate() {
             if let Some(name) = self.get_section_name(i) {
-                self.section_map.insert(name.to_string(), section as *const _);
+                self.section_map
+                    .insert(name.to_string(), section as *const _);
             }
         }
         Ok(())
     }
 
     fn get_section(&self, name: &str) -> Option<&Elf64_Shdr> {
-        self.section_map
-            .get(name)
-            .map(|&ptr| unsafe { &*ptr })
+        self.section_map.get(name).map(|&ptr| unsafe { &*ptr })
     }
 
     fn parse_symbol_table(&mut self) -> Result<()> {
         // Try to get .symtab first
-        let symtab_section = self.get_section(".symtab").or_else(|| self.get_section(".dynsym"));
+        let symtab_section = self
+            .get_section(".symtab")
+            .or_else(|| self.get_section(".dynsym"));
 
         let symtab = match symtab_section {
             Some(sec) => sec,
@@ -296,7 +296,8 @@ impl Elf {
             if st_value != 0 && st_name != 0 && st_type != STT_TLS {
                 let start = FileAddr::from(self, st_value);
                 let end = FileAddr::from(self, st_value + st_size);
-                self.symbol_addr_map.insert((start, end), symbol as *const _);
+                self.symbol_addr_map
+                    .insert((start, end), symbol as *const _);
             }
         }
         Ok(())
@@ -305,7 +306,9 @@ impl Elf {
     /// Returns a string slice from the string table at the given index.
     /// Falls back to ".dynstr" if ".strtab" not found. Returns empty string if neither exists.
     pub fn get_string(&self, index: usize) -> &str {
-        let opt_strtab = self.get_section(".strtab").or_else(|| self.get_section(".dynstr"));
+        let opt_strtab = self
+            .get_section(".strtab")
+            .or_else(|| self.get_section(".dynstr"));
 
         if let Some(strtab) = opt_strtab {
             let start = unsafe { self.data_ptr.add(strtab.sh_offset as usize + index) };
@@ -330,8 +333,9 @@ impl Elf {
 
     pub fn get_symbols_by_name(&self, name: &str) -> Vec<&Elf64_Sym> {
         if let Some(symbols) = self.symbol_name_map.get(name) {
-            symbols.iter()
-                .map(|&ptr| unsafe { &*ptr })  // Convert *const Elf64_Sym to &Elf64_Sym
+            symbols
+                .iter()
+                .map(|&ptr| unsafe { &*ptr }) // Convert *const Elf64_Sym to &Elf64_Sym
                 .collect()
         } else {
             Vec::new()
@@ -345,7 +349,8 @@ impl Elf {
 
         let null_addr = FileAddr::from(self, 0);
 
-        self.symbol_addr_map.get(&(address, null_addr))
+        self.symbol_addr_map
+            .get(&(address, null_addr))
             .map(|&ptr| unsafe { &*ptr })
     }
 
@@ -361,7 +366,9 @@ impl Elf {
         let null_addr = FileAddr::from(self, 0);
 
         // lower_bound equivalent: range starting from key
-        let mut range = self.symbol_addr_map.range((Included((address, null_addr)), Unbounded));
+        let mut range = self
+            .symbol_addr_map
+            .range((Included((address, null_addr)), Unbounded));
 
         if let Some((&(start, _), &ptr)) = range.next() {
             if start == address {
@@ -372,7 +379,9 @@ impl Elf {
         }
 
         // check the previous entry if any
-        let mut prev_range = self.symbol_addr_map.range((Unbounded, Included((address, null_addr))));
+        let mut prev_range = self
+            .symbol_addr_map
+            .range((Unbounded, Included((address, null_addr))));
         if let Some((&(start, end), &ptr)) = prev_range.next_back() {
             if start < address && address < end {
                 return Some(unsafe { &*ptr });
@@ -384,5 +393,26 @@ impl Elf {
 
     pub fn get_symbol_containing_address_virt(&self, address: VirtAddr) -> Option<&Elf64_Sym> {
         self.get_symbol_containing_address(address.to_file_addr(self))
+    }
+
+    pub fn get_section_bytes(&self, name: &str) -> Option<Vec<u8>> {
+        let section = self.get_section(name)?;
+        let offset = section.sh_offset as usize;
+        let size = section.sh_size as usize;
+
+        if offset + size > self.file_size {
+            return None;
+        }
+
+        unsafe {
+            let ptr = self.data_ptr.add(offset);
+            Some(std::slice::from_raw_parts(ptr, size).to_vec())
+        }
+    }
+
+    pub fn dwarf(&self) -> &Dwarf {
+        self.dwarf_data
+            .as_ref()
+            .expect("DWARF data not initialized")
     }
 }

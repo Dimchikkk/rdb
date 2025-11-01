@@ -1,10 +1,17 @@
-use nix::{libc::{self, c_long, PTRACE_PEEKDATA, PTRACE_POKEDATA}, unistd::Pid};
 use anyhow::Result;
-use libc::{ptrace, c_void};
-use std::ptr;
+use libc::{c_void, ptrace};
+use nix::{
+    libc::{self, c_long, PTRACE_PEEKDATA, PTRACE_POKEDATA},
+    unistd::Pid,
+};
 use std::io::Error;
+use std::ptr;
 
-use crate::{registers::UserRegisters, stoppoint::{Stoppoint, StoppointMode}, types::VirtAddr};
+use crate::{
+    registers::UserRegisters,
+    stoppoint::{Stoppoint, StoppointMode},
+    types::VirtAddr,
+};
 
 #[derive(Clone)]
 pub struct BreakpointSite {
@@ -16,6 +23,7 @@ pub struct BreakpointSite {
     pub is_hardware: bool,
     pub is_internal: bool,
     pub hardware_register_index: i32,
+    pub parent_breakpoint_id: Option<i32>,
 }
 
 impl Stoppoint for BreakpointSite {
@@ -43,7 +51,8 @@ impl Stoppoint for BreakpointSite {
         }
 
         if self.is_hardware {
-            self.hardware_register_index = self.set_hardware_stoppoint(registers, self.address, StoppointMode::Execute, 1);
+            self.hardware_register_index =
+                self.set_hardware_stoppoint(registers, self.address, StoppointMode::Execute, 1);
         } else {
             unsafe {
                 *libc::__errno_location() = 0;
@@ -124,7 +133,6 @@ impl Stoppoint for BreakpointSite {
                     self.pid,
                     self.address.0 as *mut c_void,
                     restored_data as c_long,
-
                 )
             };
 
@@ -133,9 +141,7 @@ impl Stoppoint for BreakpointSite {
             }
         }
 
-
         self.is_enabled = false;
         Ok(())
     }
-
 }

@@ -1,7 +1,10 @@
-use nix::unistd::Pid;
 use anyhow::Result;
+use nix::unistd::Pid;
 
-use crate::{stoppoint::{Stoppoint, StoppointMode}, types::VirtAddr};
+use crate::{
+    stoppoint::{Stoppoint, StoppointMode},
+    types::VirtAddr,
+};
 
 #[derive(Clone)]
 pub struct Watchpoint {
@@ -42,7 +45,7 @@ impl Stoppoint for Watchpoint {
     }
 
     fn pid(&self) -> Pid {
-       self.pid
+        self.pid
     }
 
     fn address(&self) -> VirtAddr {
@@ -58,7 +61,8 @@ impl Stoppoint for Watchpoint {
             return Ok(());
         }
 
-        self.hardware_register_index = self.set_hardware_stoppoint(registers, self.address, self.mode.clone(), self.size);
+        self.hardware_register_index =
+            self.set_hardware_stoppoint(registers, self.address, self.mode.clone(), self.size);
 
         self.is_enabled = true;
         Ok(())

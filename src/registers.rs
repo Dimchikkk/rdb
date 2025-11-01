@@ -1,11 +1,11 @@
-use std::mem::{offset_of, zeroed};
 use anyhow::{bail, Result};
+use libc::{c_void, ptrace};
+use nix::libc::{self, user, user_fpregs_struct, user_regs_struct, PTRACE_SETFPREGS};
 use nix::sys::ptrace::write_user;
 use nix::unistd::Pid;
-use nix::libc::{self, user, user_fpregs_struct, user_regs_struct, PTRACE_SETFPREGS};
-use libc::{ptrace, c_void};
-use std::ptr;
 use std::io::Error;
+use std::mem::{offset_of, zeroed};
+use std::ptr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterType {
@@ -28,28 +28,137 @@ pub enum RegisterFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RegisterId {
     // General Purpose Registers
-    RAX, RDX, RCX, RBX, RSI, RDI, RBP, RSP,
-    R8, R9, R10, R11, R12, R13, R14, R15,
-    RIP, EFLAGS, CS, FS, GS, SS, DS, ES, ORIG_RAX,
+    RAX,
+    RDX,
+    RCX,
+    RBX,
+    RSI,
+    RDI,
+    RBP,
+    RSP,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    RIP,
+    EFLAGS,
+    CS,
+    FS,
+    GS,
+    SS,
+    DS,
+    ES,
+    ORIG_RAX,
 
     // Sub-registers
-    EAX, EDX, ECX, EBX, ESI, EDI, EBP, ESP,
-    R8D, R9D, R10D, R11D, R12D, R13D, R14D, R15D,
-    AX, DX, CX, BX, SI, DI, BP, SP,
-    R8W, R9W, R10W, R11W, R12W, R13W, R14W, R15W,
-    AH, DH, CH, BH,
-    AL, DL, CL, BL, SIL, DIL, BPL, SPL,
-    R8B, R9B, R10B, R11B, R12B, R13B, R14B, R15B,
+    EAX,
+    EDX,
+    ECX,
+    EBX,
+    ESI,
+    EDI,
+    EBP,
+    ESP,
+    R8D,
+    R9D,
+    R10D,
+    R11D,
+    R12D,
+    R13D,
+    R14D,
+    R15D,
+    AX,
+    DX,
+    CX,
+    BX,
+    SI,
+    DI,
+    BP,
+    SP,
+    R8W,
+    R9W,
+    R10W,
+    R11W,
+    R12W,
+    R13W,
+    R14W,
+    R15W,
+    AH,
+    DH,
+    CH,
+    BH,
+    AL,
+    DL,
+    CL,
+    BL,
+    SIL,
+    DIL,
+    BPL,
+    SPL,
+    R8B,
+    R9B,
+    R10B,
+    R11B,
+    R12B,
+    R13B,
+    R14B,
+    R15B,
 
     // Floating Point
-    FCW, FSW, FTW, FOP, FRIP, FRDP, MXCSR, MXCSRMASK,
-    ST0, ST1, ST2, ST3, ST4, ST5, ST6, ST7,
-    MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
-    XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
-    XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15,
+    FCW,
+    FSW,
+    FTW,
+    FOP,
+    FRIP,
+    FRDP,
+    MXCSR,
+    MXCSRMASK,
+    ST0,
+    ST1,
+    ST2,
+    ST3,
+    ST4,
+    ST5,
+    ST6,
+    ST7,
+    MM0,
+    MM1,
+    MM2,
+    MM3,
+    MM4,
+    MM5,
+    MM6,
+    MM7,
+    XMM0,
+    XMM1,
+    XMM2,
+    XMM3,
+    XMM4,
+    XMM5,
+    XMM6,
+    XMM7,
+    XMM8,
+    XMM9,
+    XMM10,
+    XMM11,
+    XMM12,
+    XMM13,
+    XMM14,
+    XMM15,
 
     // Debug Registers
-    DR0, DR1, DR2, DR3, DR4, DR5, DR6, DR7,
+    DR0,
+    DR1,
+    DR2,
+    DR3,
+    DR4,
+    DR5,
+    DR6,
+    DR7,
 }
 
 pub const DEBUG_REG_IDS: [RegisterId; 8] = [
@@ -86,31 +195,81 @@ macro_rules! define_registers {
 }
 
 macro_rules! gpr_offset {
-    (RAX) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rax) };
-    (RBX) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rbx) };
-    (RCX) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rcx) };
-    (RDX) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rdx) };
-    (RSI) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rsi) };
-    (RDI) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rdi) };
-    (RBP) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rbp) };
-    (RSP) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rsp) };
-    (R8)  => { offset_of!(user, regs) + offset_of!(user_regs_struct, r8) };
-    (R9)  => { offset_of!(user, regs) + offset_of!(user_regs_struct, r9) };
-    (R10) => { offset_of!(user, regs) + offset_of!(user_regs_struct, r10) };
-    (R11) => { offset_of!(user, regs) + offset_of!(user_regs_struct, r11) };
-    (R12) => { offset_of!(user, regs) + offset_of!(user_regs_struct, r12) };
-    (R13) => { offset_of!(user, regs) + offset_of!(user_regs_struct, r13) };
-    (R14) => { offset_of!(user, regs) + offset_of!(user_regs_struct, r14) };
-    (R15) => { offset_of!(user, regs) + offset_of!(user_regs_struct, r15) };
-    (RIP) => { offset_of!(user, regs) + offset_of!(user_regs_struct, rip) };
-    (EFLAGS) => { offset_of!(user, regs) + offset_of!(user_regs_struct, eflags) };
-    (CS) => { offset_of!(user, regs) + offset_of!(user_regs_struct, cs) };
-    (SS) => { offset_of!(user, regs) + offset_of!(user_regs_struct, ss) };
-    (DS) => { offset_of!(user, regs) + offset_of!(user_regs_struct, ds) };
-    (ES) => { offset_of!(user, regs) + offset_of!(user_regs_struct, es) };
-    (FS) => { offset_of!(user, regs) + offset_of!(user_regs_struct, fs) };
-    (GS) => { offset_of!(user, regs) + offset_of!(user_regs_struct, gs) };
-    (ORIG_RAX) => { offset_of!(user, regs) + offset_of!(user_regs_struct, orig_rax) };
+    (RAX) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rax)
+    };
+    (RBX) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rbx)
+    };
+    (RCX) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rcx)
+    };
+    (RDX) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rdx)
+    };
+    (RSI) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rsi)
+    };
+    (RDI) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rdi)
+    };
+    (RBP) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rbp)
+    };
+    (RSP) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rsp)
+    };
+    (R8) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r8)
+    };
+    (R9) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r9)
+    };
+    (R10) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r10)
+    };
+    (R11) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r11)
+    };
+    (R12) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r12)
+    };
+    (R13) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r13)
+    };
+    (R14) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r14)
+    };
+    (R15) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, r15)
+    };
+    (RIP) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, rip)
+    };
+    (EFLAGS) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, eflags)
+    };
+    (CS) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, cs)
+    };
+    (SS) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, ss)
+    };
+    (DS) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, ds)
+    };
+    (ES) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, es)
+    };
+    (FS) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, fs)
+    };
+    (GS) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, gs)
+    };
+    (ORIG_RAX) => {
+        offset_of!(user, regs) + offset_of!(user_regs_struct, orig_rax)
+    };
 }
 
 macro_rules! dr_offset {
@@ -164,31 +323,75 @@ macro_rules! define_gpr_8l {
 }
 
 macro_rules! fpr_offset {
-    (cwd)       => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, cwd) };
-    (swd)       => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, swd) };
-    (ftw)       => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, ftw) };
-    (fop)       => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, fop) };
-    (rip)       => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, rip) };
-    (rdp)       => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, rdp) };
-    (mxcsr)     => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, mxcsr) };
-    (mxcr_mask) => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, mxcr_mask) };
-    (st_space)  => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, st_space) };
-    (xmm_space) => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, xmm_space) };
-    (padding)   => { offset_of!(user, i387) + offset_of!(user_fpregs_struct, padding) };
+    (cwd) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, cwd)
+    };
+    (swd) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, swd)
+    };
+    (ftw) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, ftw)
+    };
+    (fop) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, fop)
+    };
+    (rip) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, rip)
+    };
+    (rdp) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, rdp)
+    };
+    (mxcsr) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, mxcsr)
+    };
+    (mxcr_mask) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, mxcr_mask)
+    };
+    (st_space) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, st_space)
+    };
+    (xmm_space) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, xmm_space)
+    };
+    (padding) => {
+        offset_of!(user, i387) + offset_of!(user_fpregs_struct, padding)
+    };
 }
 
 macro_rules! fpr_size {
-    (cwd)       => { core::mem::size_of::<u16>() };
-    (swd)       => { core::mem::size_of::<u16>() };
-    (ftw)       => { core::mem::size_of::<u16>() };
-    (fop)       => { core::mem::size_of::<u16>() };
-    (rip)       => { core::mem::size_of::<u64>() };
-    (rdp)       => { core::mem::size_of::<u64>() };
-    (mxcsr)     => { core::mem::size_of::<u32>() };
-    (mxcr_mask) => { core::mem::size_of::<u32>() };
-    (st_space)  => { core::mem::size_of::<[u32; 32]>() };
-    (xmm_space) => { core::mem::size_of::<[u32; 64]>() };
-    (padding)   => { core::mem::size_of::<[u32; 24]>() };
+    (cwd) => {
+        core::mem::size_of::<u16>()
+    };
+    (swd) => {
+        core::mem::size_of::<u16>()
+    };
+    (ftw) => {
+        core::mem::size_of::<u16>()
+    };
+    (fop) => {
+        core::mem::size_of::<u16>()
+    };
+    (rip) => {
+        core::mem::size_of::<u64>()
+    };
+    (rdp) => {
+        core::mem::size_of::<u64>()
+    };
+    (mxcsr) => {
+        core::mem::size_of::<u32>()
+    };
+    (mxcr_mask) => {
+        core::mem::size_of::<u32>()
+    };
+    (st_space) => {
+        core::mem::size_of::<[u32; 32]>()
+    };
+    (xmm_space) => {
+        core::mem::size_of::<[u32; 64]>()
+    };
+    (padding) => {
+        core::mem::size_of::<[u32; 24]>()
+    };
 }
 
 macro_rules! define_fpr {
@@ -384,7 +587,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_gpr_64!(DS, 53),
     define_gpr_64!(ES, 50),
     define_gpr_64!(ORIG_RAX, -1),
-
     // 32-bit subregisters
     define_gpr_32!(EAX, RAX),
     define_gpr_32!(EDX, RDX),
@@ -402,7 +604,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_gpr_32!(R13D, R13),
     define_gpr_32!(R14D, R14),
     define_gpr_32!(R15D, R15),
-
     // 16-bit subregisters
     define_gpr_16!(AX, RAX),
     define_gpr_16!(DX, RDX),
@@ -420,13 +621,11 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_gpr_16!(R13W, R13),
     define_gpr_16!(R14W, R14),
     define_gpr_16!(R15W, R15),
-
     // 8-bit subregisters
     define_gpr_8h!(AH, RAX),
     define_gpr_8h!(DH, RDX),
     define_gpr_8h!(CH, RCX),
     define_gpr_8h!(BH, RBX),
-
     define_gpr_8l!(AL, RAX),
     define_gpr_8l!(DL, RDX),
     define_gpr_8l!(CL, RCX),
@@ -443,7 +642,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_gpr_8l!(R13B, R13),
     define_gpr_8l!(R14B, R14),
     define_gpr_8l!(R15B, R15),
-
     // Floating Point Control Registers
     define_fpr!(FCW, 65, cwd),
     define_fpr!(FSW, 66, swd),
@@ -453,7 +651,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_fpr!(FRDP, -1, rdp),
     define_fpr!(MXCSR, 64, mxcsr),
     define_fpr!(MXCSRMASK, -1, mxcr_mask),
-
     // FP Stack Registers
     define_fp_st!(0),
     define_fp_st!(1),
@@ -463,7 +660,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_fp_st!(5),
     define_fp_st!(6),
     define_fp_st!(7),
-
     // MM Registers
     define_fp_mm!(0),
     define_fp_mm!(1),
@@ -473,7 +669,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_fp_mm!(5),
     define_fp_mm!(6),
     define_fp_mm!(7),
-
     // XMM Registers
     define_fp_xmm!(0),
     define_fp_xmm!(1),
@@ -491,7 +686,6 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
     define_fp_xmm!(13),
     define_fp_xmm!(14),
     define_fp_xmm!(15),
-
     // Debug Registers
     define_dr!(0),
     define_dr!(1),
@@ -505,9 +699,10 @@ pub const REGISTERS: &[RegisterInfo] = define_registers![
 
 pub fn register_info_by<F>(f: F) -> &'static RegisterInfo
 where
-    F: FnMut(&&RegisterInfo) -> bool
+    F: FnMut(&&RegisterInfo) -> bool,
 {
-    REGISTERS.iter()
+    REGISTERS
+        .iter()
         .find(f)
         .unwrap_or_else(|| panic!("Can't find register info"))
 }
@@ -546,7 +741,9 @@ impl RegisterValue {
             RegisterValue::U8(_) | RegisterValue::I8(_) => 1,
             RegisterValue::U16(_) | RegisterValue::I16(_) => 2,
             RegisterValue::U32(_) | RegisterValue::I32(_) | RegisterValue::F32(_) => 4,
-            RegisterValue::U64(_) | RegisterValue::I64(_) | RegisterValue::F64(_)
+            RegisterValue::U64(_)
+            | RegisterValue::I64(_)
+            | RegisterValue::F64(_)
             | RegisterValue::Bytes64(_) => 8,
             RegisterValue::Bytes128(_) => 16,
         }
@@ -555,11 +752,7 @@ impl RegisterValue {
 
 impl UserRegisters {
     pub fn new() -> Self {
-        unsafe {
-            UserRegisters {
-                data: zeroed(),
-            }
-        }
+        unsafe { UserRegisters { data: zeroed() } }
     }
 
     pub fn read(&self, info: &RegisterInfo) -> RegisterValue {
@@ -594,7 +787,10 @@ impl UserRegisters {
                     ptr.copy_to_nonoverlapping(bytes.as_mut_ptr(), 16);
                     RegisterValue::Bytes128(bytes)
                 }
-                (size, format) => panic!("Unsupported register (size, format): ({} , {:?})", size, format),
+                (size, format) => panic!(
+                    "Unsupported register (size, format): ({} , {:?})",
+                    size, format
+                ),
             }
         }
     }
@@ -635,7 +831,6 @@ impl UserRegisters {
     }
 }
 
-
 pub fn write_user_area(pid: Pid, offset: usize, data: u64) -> Result<()> {
     if write_user(pid, offset as _, data as i64).is_err() {
         bail!("Could not write to user area");
@@ -666,8 +861,12 @@ pub fn write_fprs(pid: Pid, fprs: &user_fpregs_struct) -> Result<()> {
 //     Ok(())
 // }
 
-
-pub fn write_register(pid: Pid, registers: &mut UserRegisters, info: &RegisterInfo, val: RegisterValue) {
+pub fn write_register(
+    pid: Pid,
+    registers: &mut UserRegisters,
+    info: &RegisterInfo,
+    val: RegisterValue,
+) {
     registers.write_raw(info, val);
 
     if info.register_type == RegisterType::Fpr {
@@ -677,16 +876,14 @@ pub fn write_register(pid: Pid, registers: &mut UserRegisters, info: &RegisterIn
         // align offset down to 8 bytes and write that word
         let aligned_offset = info.offset & !0b111;
         let aligned_value = unsafe {
-            let aligned_ptr = (&registers.data.regs as *const _ as *const u8)
-                .add(aligned_offset);
+            let aligned_ptr = (&registers.data.regs as *const _ as *const u8).add(aligned_offset);
             aligned_ptr.cast::<u64>().read()
         };
-        write_user_area(pid, aligned_offset, aligned_value)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to write GPR/debug at offset {}: {}",
-                    aligned_offset, e
-                )
-            });
+        write_user_area(pid, aligned_offset, aligned_value).unwrap_or_else(|e| {
+            panic!(
+                "Failed to write GPR/debug at offset {}: {}",
+                aligned_offset, e
+            )
+        });
     }
 }

@@ -1,5 +1,8 @@
 use anyhow::{bail, Result};
 
+use crate::process::Process;
+use crate::types::VirtAddr;
+
 pub trait FromBytes: Sized {
     fn from_bytes(bytes: &[u8]) -> Result<Self>;
 }
@@ -72,4 +75,11 @@ pub fn parse_vector(text: &str) -> Result<Vec<u8>> {
     }
 
     Ok(result)
+}
+
+pub fn print_disassembly(process: &Process, address: VirtAddr, n_instructions: usize) {
+    let instructions = process.disassemble(n_instructions, Some(address));
+    for instr in instructions {
+        println!("{:#018x}: {}", instr.address.0, instr.text);
+    }
 }

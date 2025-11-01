@@ -1,22 +1,24 @@
-use std::{cmp::Ordering, ops::{Add, AddAssign, Sub, SubAssign}};
+use std::{
+    cmp::Ordering,
+    ops::{Add, AddAssign, Sub, SubAssign},
+};
 
 use crate::elf::Elf;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VirtAddr(pub u64);
 
 impl VirtAddr {
     pub fn to_file_addr(&self, obj: &Elf) -> FileAddr {
-        // Check if this virt addr belongs to a section in the given elf
-        if obj.get_section_containing_addr_virt(*self).is_none() {
-            return FileAddr::from(obj, 0);
-        }
-        // Calculate file address offset by subtracting load bias
+        // Calculate file address offset by subtracting load bias. Even if the
+        // section lookup fails (e.g. stripped binaries or linker generated
+        // thunks), mapping through the load bias still yields the correct file
+        // relative address for DWARF queries.
         FileAddr::from(obj, self.0 - obj.load_bias.0)
     }
 }
 
-impl Add<i64> for VirtAddr  {
+impl Add<i64> for VirtAddr {
     type Output = Self;
 
     fn add(self, offset: i64) -> Self {
@@ -24,7 +26,7 @@ impl Add<i64> for VirtAddr  {
     }
 }
 
-impl Sub<i64> for VirtAddr  {
+impl Sub<i64> for VirtAddr {
     type Output = Self;
 
     fn sub(self, offset: i64) -> Self {
@@ -44,7 +46,7 @@ impl SubAssign<i64> for VirtAddr {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct FileAddr {
     elf: *const Elf,
     addr: u64,
@@ -52,7 +54,10 @@ pub struct FileAddr {
 
 impl FileAddr {
     pub fn from(elf: &Elf, addr: u64) -> Self {
-        FileAddr { elf: elf as *const Elf, addr }
+        FileAddr {
+            elf: elf as *const Elf,
+            addr,
+        }
     }
 
     pub fn addr(&self) -> u64 {
@@ -65,7 +70,9 @@ impl FileAddr {
     }
 
     pub fn to_virt_addr(&self) -> VirtAddr {
-        let elf = self.elf_file().expect("to_virt_addr called on null address");
+        let elf = self
+            .elf_file()
+            .expect("to_virt_addr called on null address");
         if elf.get_section_containing_addr(*self).is_none() {
             return VirtAddr(0);
         }
@@ -79,7 +86,10 @@ impl Add<i64> for FileAddr {
 
     fn add(self, offset: i64) -> Self {
         let new_addr = (self.addr as i64).wrapping_add(offset) as u64;
-        FileAddr { elf: self.elf, addr: new_addr }
+        FileAddr {
+            elf: self.elf,
+            addr: new_addr,
+        }
     }
 }
 
@@ -114,13 +124,19 @@ impl Eq for FileAddr {}
 // Ordering compares only if elf pointers are same, else panics (like your asserts)
 impl PartialOrd for FileAddr {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        assert!(self.elf == other.elf, "Comparing FileAddr from different ELF files");
+        assert!(
+            self.elf == other.elf,
+            "Comparing FileAddr from different ELF files"
+        );
         Some(self.addr.cmp(&other.addr))
     }
 }
 impl Ord for FileAddr {
     fn cmp(&self, other: &Self) -> Ordering {
-        assert!(self.elf == other.elf, "Comparing FileAddr from different ELF files");
+        assert!(
+            self.elf == other.elf,
+            "Comparing FileAddr from different ELF files"
+        );
         self.addr.cmp(&other.addr)
     }
 }
@@ -131,6 +147,7 @@ pub struct FileOffset {
     off: u64,
 }
 
+#[allow(dead_code)]
 impl FileOffset {
     pub fn new(elf: *const Elf, off: u64) -> Self {
         Self { elf, off }

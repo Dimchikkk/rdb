@@ -15,7 +15,9 @@ pub fn format_register_value(reg_name: &str, value: &RegisterValue) -> String {
         (name, RegisterValue::Bytes64(bytes)) if name.starts_with("mm") && bytes.len() == 8 => {
             let mut s = String::from("[");
             for (i, b) in bytes.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
+                if i > 0 {
+                    s.push_str(", ");
+                }
                 write!(s, "0x{:02x}", b).unwrap();
             }
             s.push(']');
@@ -26,7 +28,9 @@ pub fn format_register_value(reg_name: &str, value: &RegisterValue) -> String {
         (name, RegisterValue::Bytes128(bytes)) if name.starts_with("xmm") && bytes.len() == 16 => {
             let mut s = String::from("[");
             for (i, b) in bytes.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
+                if i > 0 {
+                    s.push_str(", ");
+                }
                 write!(s, "0x{:02x}", b).unwrap();
             }
             s.push(']');
@@ -51,7 +55,9 @@ pub fn format_register_value(reg_name: &str, value: &RegisterValue) -> String {
         (_, RegisterValue::Bytes64(bytes)) => {
             let mut s = String::from("[");
             for (i, b) in bytes.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
+                if i > 0 {
+                    s.push_str(", ");
+                }
                 write!(s, "0x{:02x}", b).unwrap();
             }
             s.push(']');
@@ -62,7 +68,9 @@ pub fn format_register_value(reg_name: &str, value: &RegisterValue) -> String {
         (_, RegisterValue::Bytes128(bytes)) => {
             let mut s = String::from("[");
             for (i, b) in bytes.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
+                if i > 0 {
+                    s.push_str(", ");
+                }
                 write!(s, "0x{:02x}", b).unwrap();
             }
             s.push(']');
@@ -93,7 +101,11 @@ fn decode_f80_to_f64(bytes: &[u8]) -> f64 {
     if exponent == 0x7FFF {
         // Inf or NaN
         return if mantissa == 0 {
-            if sign { f64::NEG_INFINITY } else { f64::INFINITY }
+            if sign {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
         } else {
             f64::NAN
         };
@@ -110,7 +122,11 @@ fn decode_f80_to_f64(bytes: &[u8]) -> f64 {
 
     let value = fraction * 2f64.powi(exp);
 
-    if sign { -value } else { value }
+    if sign {
+        -value
+    } else {
+        value
+    }
 }
 
 pub fn f64_to_x87_long_double_bytes(value: f64) -> [u8; 16] {
@@ -139,7 +155,7 @@ pub fn f64_to_x87_long_double_bytes(value: f64) -> [u8; 16] {
     let ext_exp = (exp - 1023 + 16383) as u16;
 
     // Construct extended fraction with explicit integer bit (bit 63 = 1)
-    let ext_frac = (1u64 << 63) | (frac << (63 - 52)); 
+    let ext_frac = (1u64 << 63) | (frac << (63 - 52));
 
     // Write fraction (64 bits, little endian)
     bytes[0..8].copy_from_slice(&ext_frac.to_le_bytes());
@@ -152,10 +168,7 @@ pub fn f64_to_x87_long_double_bytes(value: f64) -> [u8; 16] {
     bytes
 }
 
-pub fn parse_register_value(
-    info: &RegisterInfo,
-    text: &str,
-) -> Result<RegisterValue, String> {
+pub fn parse_register_value(info: &RegisterInfo, text: &str) -> Result<RegisterValue, String> {
     fn strip_0x(s: &str) -> &str {
         if s.starts_with("0x") || s.starts_with("0X") {
             &s[2..]
@@ -179,12 +192,7 @@ pub fn parse_register_value(
                 2 => RegisterValue::U16(raw as u16),
                 4 => RegisterValue::U32(raw as u32),
                 8 => RegisterValue::U64(raw),
-                other => {
-                    return Err(format!(
-                        "{}: Unsupported Uint size {}",
-                        info.name, other
-                    ))
-                }
+                other => return Err(format!("{}: Unsupported Uint size {}", info.name, other)),
             };
             Ok(result)
         }

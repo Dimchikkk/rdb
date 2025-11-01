@@ -1,43 +1,47 @@
+use anyhow::{bail, Context, Result};
+use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+use libc::{c_void, ptrace};
+use nix::fcntl::OFlag;
+use nix::libc::{
+    self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, ADDR_NO_RANDOMIZE,
+    PTRACE_GETFPREGS, PTRACE_O_TRACESYSGOOD, PTRACE_PEEKUSER, PTRACE_SETOPTIONS,
+};
+use nix::sys::ptrace::{attach, cont, detach, getregs, getsiginfo, step, syscall, traceme};
+use nix::sys::signal::Signal::SIGTRAP;
+use nix::sys::signal::{kill, Signal};
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
+use rustc_demangle::demangle;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
-use nix::fcntl::OFlag;
-use nix::sys::signal::Signal::SIGTRAP;
-use rustc_demangle::demangle;
-use sysnames::Syscalls;
-use std::os::unix::io::RawFd;
-use anyhow::{bail, Context, Result};
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::sys::ptrace::{attach, cont, detach, getregs, getsiginfo, step, syscall, traceme };
-use nix::unistd::{close, execv, fork, pipe2, ForkResult, Pid};
-use nix::sys::signal::{kill, Signal};
-use nix::libc::{self, c_long, c_ulong, iovec, personality, process_vm_readv, setpgid, ADDR_NO_RANDOMIZE, PTRACE_GETFPREGS, PTRACE_O_TRACESYSGOOD, PTRACE_PEEKUSER, PTRACE_SETOPTIONS};
-use libc::{ptrace, c_void};
 use std::{mem, ptr};
-use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+use sysnames::Syscalls;
 
 use crate::breakpoints::BreakpointSite;
 use crate::elf::{elf64_st_type, STT_FUNC};
-use crate::syscall::{CatchPolicyMode, SyscallCatchPolicy, SyscallData, SyscallInformation};
-use crate::print_disassembly;
-use crate::registers::{register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS};
+use crate::registers::{
+    register_info_by_id, write_register, RegisterId, RegisterValue, UserRegisters, DEBUG_REG_IDS,
+};
 use crate::stoppoint::{Stoppoint, StoppointCollection, StoppointMode};
+use crate::syscall::{CatchPolicyMode, SyscallCatchPolicy, SyscallData, SyscallInformation};
 use crate::target::Target;
 use crate::types::VirtAddr;
-use crate::utils::FromBytes;
+use crate::utils::{print_disassembly, FromBytes};
 use crate::watchpoint::Watchpoint;
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pstatus {
     Stopped,
     Running,
     Terminated,
-    Exited
+    Exited,
 }
 
 pub struct StopReason {
@@ -48,7 +52,60 @@ pub struct StopReason {
     syscall_info: Option<SyscallInformation>,
 }
 
-#[derive(PartialEq, Eq)]
+impl StopReason {
+    pub fn synthetic_single_step() -> Self {
+        StopReason {
+            reason: Pstatus::Stopped,
+            status: None,
+            signal: Some(SIGTRAP),
+            trap_reason: Some(TrapType::SingleStep),
+            syscall_info: None,
+        }
+    }
+
+    pub fn is_step(&self) -> bool {
+        self.reason == Pstatus::Stopped
+            && self.signal == Some(SIGTRAP)
+            && self.trap_reason == Some(TrapType::SingleStep)
+    }
+
+    pub fn mark_as_single_step(&mut self) {
+        self.reason = Pstatus::Stopped;
+        self.signal = Some(SIGTRAP);
+        self.trap_reason = Some(TrapType::SingleStep);
+    }
+
+    pub fn is_breakpoint(&self) -> bool {
+        self.reason == Pstatus::Stopped
+            && self.signal == Some(SIGTRAP)
+            && matches!(
+                self.trap_reason,
+                Some(TrapType::SoftwareBreak | TrapType::HardwareBreak)
+            )
+    }
+
+    pub fn trap_reason(&self) -> Option<TrapType> {
+        self.trap_reason
+    }
+
+    pub fn signal(&self) -> Option<Signal> {
+        self.signal
+    }
+
+    pub fn status(&self) -> Pstatus {
+        self.reason
+    }
+
+    pub fn exit_status(&self) -> Option<u8> {
+        self.status
+    }
+
+    pub fn syscall_info(&self) -> Option<&SyscallInformation> {
+        self.syscall_info.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapType {
     SingleStep,
     SoftwareBreak,
@@ -74,27 +131,40 @@ pub struct Instruction {
     pub text: String,
 }
 
-pub fn handle_stop(target: &mut Target, reason: StopReason) {
-    let rip = {
-        let process = &mut target.process;
-        process.get_pc().unwrap().0
+pub fn handle_stop(target: &mut Target, reason: &StopReason) {
+    let rip = match target.process.get_pc() {
+        Ok(pc) => pc.0,
+        Err(_) => 0,
     };
 
-    println!("Process {} stopped at address 0x{:x}", target.process.pid, rip);
+    println!(
+        "Process {} stopped at address 0x{:x}",
+        target.process.pid, rip
+    );
 
-    match reason.reason {
+    match reason.status() {
         Pstatus::Stopped => {
-            println!("stopped with signal {}", reason.signal.unwrap().to_string());
-            if reason.signal == Some(SIGTRAP) {
-                get_sigtrap_info(target, &reason);
+            if let Some(signal) = reason.signal() {
+                println!("stopped with signal {}", signal.to_string());
+            }
+            if reason.signal() == Some(SIGTRAP) {
+                get_sigtrap_info(target, reason);
             }
         }
         Pstatus::Running => panic!("unreachable handle_stop"),
-        Pstatus::Terminated => println!("terminated with signal: {}", reason.signal.unwrap().to_string()),
-        Pstatus::Exited => println!("exited with status {}", reason.status.unwrap().to_string()),
+        Pstatus::Terminated => {
+            if let Some(signal) = reason.signal() {
+                println!("terminated with signal: {}", signal.to_string());
+            }
+        }
+        Pstatus::Exited => {
+            if let Some(status) = reason.exit_status() {
+                println!("exited with status {}", status.to_string());
+            }
+        }
     }
 
-    if reason.reason == Pstatus::Stopped {
+    if reason.status() == Pstatus::Stopped {
         let process = &mut target.process;
         print_disassembly(process, VirtAddr(rip), 5);
     }
@@ -134,7 +204,7 @@ fn get_sigtrap_info(target: &mut Target, reason: &StopReason) {
         match id {
             HardwareStoppoint::Breakpoint(id) => {
                 println!(" (breakpoint {})", id);
-            },
+            }
             HardwareStoppoint::Watchpoint(id) => {
                 let point = process.watchpoint_sites.get_by_id_mut(id).unwrap();
                 println!(" (watchpoint {})", id);
@@ -144,7 +214,7 @@ fn get_sigtrap_info(target: &mut Target, reason: &StopReason) {
                     println!("Value: {:x}", point.previos_data);
                     println!("New value: {:x}", point.data);
                 }
-            },
+            }
         }
     }
 
@@ -155,8 +225,7 @@ fn get_sigtrap_info(target: &mut Target, reason: &StopReason) {
     if reason.trap_reason == Some(TrapType::Syscall) {
         if let Some(sys) = &reason.syscall_info {
             if sys.entry {
-                let name = Syscalls::name(sys.id as u64)
-                    .unwrap_or_else(|| "unknown");
+                let name = Syscalls::name(sys.id as u64).unwrap_or_else(|| "unknown");
 
                 // extract the args array
                 if let SyscallData::Args(args) = &sys.data {
@@ -181,7 +250,7 @@ fn get_sigtrap_info(target: &mut Target, reason: &StopReason) {
     }
 }
 
-static NEXT_BREAKPOINT_ID: AtomicI32 = AtomicI32::new(1);
+static NEXT_BREAKPOINT_SITE_ID: AtomicI32 = AtomicI32::new(1);
 static NEXT_WATCHPOINT_ID: AtomicI32 = AtomicI32::new(1);
 
 pub enum HardwareStoppoint {
@@ -265,15 +334,12 @@ impl Process {
                     bail!("Error from child: {}", error_message);
                 }
 
-                waitpid(child, None)?;
-                set_ptrace_options(child)?;
-
                 println!("Launched child process for {}: {}", program_path, child);
                 let user_registers = UserRegisters::new();
 
-                Ok(Process {
+                let mut process = Process {
                     pid: child,
-                    status: Some(Pstatus::Running),
+                    status: None,
                     terminate_on_end: true,
                     is_attached: true,
                     registers: user_registers,
@@ -282,7 +348,13 @@ impl Process {
                     syscall_catch_policy: SyscallCatchPolicy::catch_none(),
                     expecting_syscall_exit: false,
                     _not_send_or_sync: PhantomData,
-                })
+                };
+
+                // Wait for the child to stop after exec and properly handle the initial stop
+                process.wait_on_signal()?;
+                set_ptrace_options(child)?;
+
+                Ok(process)
             }
             Ok(ForkResult::Child) => {
                 let read_raw_fd = read_fd.into_raw_fd();
@@ -340,7 +412,7 @@ impl Process {
                             trap_reason: None,
                             syscall_info: None,
                         })
-                    },
+                    }
                     WaitStatus::Signaled(_pid, signal, _) => {
                         self.status = Some(Pstatus::Terminated);
                         Ok(StopReason {
@@ -350,7 +422,7 @@ impl Process {
                             trap_reason: None,
                             syscall_info: None,
                         })
-                    },
+                    }
                     WaitStatus::Stopped(_pid, signal) => {
                         self.status = Some(Pstatus::Stopped);
                         let mut reason = StopReason {
@@ -366,9 +438,15 @@ impl Process {
 
                             let instr_begin = self.get_pc()? - 1;
                             let is_sigtrap = signal == SIGTRAP;
-                            let is_software_breakpoint = reason.trap_reason == Some(TrapType::SoftwareBreak);
+                            let is_software_breakpoint =
+                                reason.trap_reason == Some(TrapType::SoftwareBreak);
 
-                            if  is_software_breakpoint && is_sigtrap && self.breakpoint_sites.enabled_stoppoint_at_address(instr_begin) {
+                            if is_software_breakpoint
+                                && is_sigtrap
+                                && self
+                                    .breakpoint_sites
+                                    .enabled_stoppoint_at_address(instr_begin)
+                            {
                                 self.set_pc(instr_begin)?;
                             }
 
@@ -379,19 +457,21 @@ impl Process {
                                     HardwareStoppoint::Breakpoint(_) => {}
                                     HardwareStoppoint::Watchpoint(id) => {
                                         let (address, size) = {
-                                            let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
+                                            let watchpoint =
+                                                self.watchpoint_sites.get_by_id_mut(id).unwrap();
                                             (watchpoint.address(), watchpoint.size)
                                         };
 
                                         let memory = self.read_memory(address, size)?;
-                                        let watchpoint = self.watchpoint_sites.get_by_id_mut(id).unwrap();
+                                        let watchpoint =
+                                            self.watchpoint_sites.get_by_id_mut(id).unwrap();
                                         watchpoint.update_data(&memory);
                                     }
                                 }
                             }
                         }
                         Ok(reason)
-                    },
+                    }
                     WaitStatus::PtraceSyscall(_pid) => {
                         self.status = Some(Pstatus::Stopped);
                         let mut reason = StopReason {
@@ -409,11 +489,11 @@ impl Process {
                             }
                         }
                         Ok(reason)
-                    },
+                    }
                     e => bail!("Process is not stopped {}: {:?}", self.pid, e),
                 };
                 reason
-            },
+            }
             Err(e) => bail!("waitpid failed {}", e),
         }
     }
@@ -508,11 +588,21 @@ impl Process {
 
     pub fn set_pc(&mut self, addr: VirtAddr) -> Result<()> {
         let info = register_info_by_id(RegisterId::RIP);
-        write_register(self.pid, &mut self.registers, info, RegisterValue::U64(addr.0));
+        write_register(
+            self.pid,
+            &mut self.registers,
+            info,
+            RegisterValue::U64(addr.0),
+        );
         Ok(())
     }
 
-    pub fn create_watchpoint(&mut self, address: VirtAddr, mode: StoppointMode, size: usize) -> Result<()> {
+    pub fn create_watchpoint(
+        &mut self,
+        address: VirtAddr,
+        mode: StoppointMode,
+        size: usize,
+    ) -> Result<()> {
         if self.watchpoint_sites.contains_address(address) {
             panic!("Watchpoint already exists at address {:#x}", address.0);
         }
@@ -544,12 +634,21 @@ impl Process {
         Ok(())
     }
 
-    pub fn create_breakpoint_site(&mut self, addr: VirtAddr, is_hardware: bool) -> Result<()> {
-        if self.breakpoint_sites.contains_address(addr) {
-            panic!("Breakpoint site already created at address {:#x}", addr.0);
+    pub fn create_breakpoint_site(
+        &mut self,
+        addr: VirtAddr,
+        is_hardware: bool,
+        is_internal: bool,
+        parent_breakpoint_id: Option<i32>,
+    ) -> Result<i32> {
+        if let Some(existing) = self.breakpoint_sites.get_by_address_mut(addr) {
+            if parent_breakpoint_id.is_some() {
+                existing.parent_breakpoint_id = parent_breakpoint_id;
+            }
+            return Ok(existing.id);
         }
 
-        let new_id = NEXT_BREAKPOINT_ID.fetch_add(1, Ordering::SeqCst);
+        let new_id = NEXT_BREAKPOINT_SITE_ID.fetch_add(1, Ordering::SeqCst);
 
         let new_site = BreakpointSite {
             id: new_id,
@@ -557,15 +656,14 @@ impl Process {
             address: addr,
             is_enabled: false,
             saved_data: 0,
-            is_internal: false,
-            hardware_register_index: -1,
             is_hardware,
+            is_internal,
+            hardware_register_index: -1,
+            parent_breakpoint_id,
         };
 
         self.breakpoint_sites.stoppoints.push(new_site);
-
-        let breakpoint = self.breakpoint_sites.stoppoints.last_mut().unwrap();
-        breakpoint.enable(&mut self.registers)
+        Ok(new_id)
     }
 
     pub fn read_memory(&self, address: VirtAddr, mut amount: usize) -> Result<Vec<u8>> {
@@ -603,22 +701,22 @@ impl Process {
         };
 
         if result < 0 {
-            return Err(anyhow::anyhow!("Could not read process memory (pid {})", self.pid)
-                       .context(std::io::Error::last_os_error()));
+            return Err(
+                anyhow::anyhow!("Could not read process memory (pid {})", self.pid)
+                    .context(std::io::Error::last_os_error()),
+            );
         }
 
         Ok(ret)
     }
 
-    pub fn read_memory_without_traps(
-        &self,
-        address: VirtAddr,
-        amount: usize,
-    ) -> Result<Vec<u8>> {
+    pub fn read_memory_without_traps(&self, address: VirtAddr, amount: usize) -> Result<Vec<u8>> {
         let mut memory = self.read_memory(address, amount)?;
 
         // Get breakpoint sites in the memory region
-        let sites = self.breakpoint_sites.get_in_region(address, address + amount.try_into().unwrap());
+        let sites = self
+            .breakpoint_sites
+            .get_in_region(address, address + amount.try_into().unwrap());
 
         for site in sites {
             if !site.is_enabled() || site.is_hardware {
@@ -650,7 +748,7 @@ impl Process {
         }
     }
 
-    pub fn read_memory_as<T: FromBytes>(self, address: VirtAddr) -> Result<T> {
+    pub fn read_memory_as<T: FromBytes>(&self, address: VirtAddr) -> Result<T> {
         let data = self.read_memory(address, std::mem::size_of::<T>())?;
         T::from_bytes(&data)
     }
@@ -685,8 +783,11 @@ impl Process {
             };
 
             if result < 0 {
-                return Err(anyhow::anyhow!("Failed to write memory at {:?}", (address + written.try_into().unwrap()).0)
-                           .context(std::io::Error::last_os_error()));
+                return Err(anyhow::anyhow!(
+                    "Failed to write memory at {:?}",
+                    (address + written.try_into().unwrap()).0
+                )
+                .context(std::io::Error::last_os_error()));
             }
 
             written += 8;
@@ -695,11 +796,17 @@ impl Process {
         Ok(())
     }
 
-    pub fn disassemble(&self, n_instructions: usize, address: Option<VirtAddr>) -> Vec<Instruction> {
+    pub fn disassemble(
+        &self,
+        n_instructions: usize,
+        address: Option<VirtAddr>,
+    ) -> Vec<Instruction> {
         let mut result = Vec::with_capacity(n_instructions);
         let addr = address.unwrap_or_else(|| self.get_pc().unwrap());
 
-        let code = self.read_memory_without_traps(addr, n_instructions * 15).unwrap();
+        let code = self
+            .read_memory_without_traps(addr, n_instructions * 15)
+            .unwrap();
         if code.is_empty() {
             return result;
         }
@@ -726,15 +833,17 @@ impl Process {
     }
 
     pub fn augment_stop_reason(&mut self, reason: &mut StopReason) -> Result<()> {
-        let info = getsiginfo(self.pid)
-            .map_err(|e| anyhow::anyhow!("Failed to getsiginfo: {}", e))?;
+        let info =
+            getsiginfo(self.pid).map_err(|e| anyhow::anyhow!("Failed to getsiginfo: {}", e))?;
 
         if reason.trap_reason == Some(TrapType::Syscall) {
-            let sys_info = reason.syscall_info.get_or_insert_with(|| SyscallInformation {
-                id: 0,
-                entry: true,
-                data: SyscallData::Args([0; 6]),
-            });
+            let sys_info = reason
+                .syscall_info
+                .get_or_insert_with(|| SyscallInformation {
+                    id: 0,
+                    entry: true,
+                    data: SyscallData::Args([0; 6]),
+                });
 
             if self.expecting_syscall_exit {
                 sys_info.entry = false;
@@ -747,8 +856,12 @@ impl Process {
                 sys_info.id = self.read_register_as_u64(RegisterId::ORIG_RAX)? as u16;
 
                 let arg_regs = [
-                    RegisterId::RDI, RegisterId::RSI, RegisterId::RDX,
-                    RegisterId::R10, RegisterId::R8,  RegisterId::R9,
+                    RegisterId::RDI,
+                    RegisterId::RSI,
+                    RegisterId::RDX,
+                    RegisterId::R10,
+                    RegisterId::R8,
+                    RegisterId::R9,
                 ];
                 let mut args = [0u64; 6];
                 for (i, reg) in arg_regs.iter().enumerate() {
@@ -770,7 +883,7 @@ impl Process {
         if reason.signal == Some(SIGTRAP) {
             reason.trap_reason = match info.si_code {
                 libc::TRAP_TRACE => Some(TrapType::SingleStep),
-                libc::SI_KERNEL => Some(TrapType::SoftwareBreak),
+                libc::TRAP_BRKPT | libc::SI_KERNEL => Some(TrapType::SoftwareBreak),
                 libc::TRAP_HWBKPT => Some(TrapType::HardwareBreak),
                 _ => None,
             };
@@ -816,11 +929,14 @@ impl Process {
             let watch_id = self.watchpoint_sites.get_by_address_mut(addr).unwrap().id();
             Ok(HardwareStoppoint::Watchpoint(watch_id))
         } else {
-            bail!("Address at DR{} not recognized as breakpoint or watchpoint", index);
+            bail!(
+                "Address at DR{} not recognized as breakpoint or watchpoint",
+                index
+            );
         }
     }
 
-    fn read_register_as_u64(&self, reg_id: RegisterId) -> Result<u64> {
+    pub fn read_register_as_u64(&self, reg_id: RegisterId) -> Result<u64> {
         let reg_info = register_info_by_id(reg_id.clone());
         match self.registers.read(reg_info) {
             RegisterValue::U64(val) => Ok(val),
@@ -879,7 +995,12 @@ fn write_to_pipe(write_fd: RawFd, message: &str) {
 
 fn set_ptrace_options(pid: Pid) -> Result<()> {
     let res = unsafe {
-        ptrace(PTRACE_SETOPTIONS, pid, std::ptr::null_mut::<c_void>(), PTRACE_O_TRACESYSGOOD)
+        ptrace(
+            PTRACE_SETOPTIONS,
+            pid,
+            std::ptr::null_mut::<c_void>(),
+            PTRACE_O_TRACESYSGOOD,
+        )
     };
 
     if res < 0 {
