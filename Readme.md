@@ -89,157 +89,56 @@ rdb> cont              # Continue
 
 ## Manual Testing
 
-### Quick Test (2 minutes)
-
-Run the automated test to verify everything works:
-
-```bash
-cargo test --test comprehensive_stepping -- --nocapture
-```
-
-You should see:
-```
-✓ Stopped at demo.rs:18
-✓ Now at line 19
-✓ Inside calculate at line 12
-✓ After add() at line 13
-✓ Inside multiply at line 7
-✓ Back in calculate at line 14
-✓ Program exited
-
-=== All Stepping Operations Successful! ===
-```
-
-### Manual Interactive Test (5 minutes)
-
-**Step 1: Compile the demo program**
-
+Compile the demo program:
 ```bash
 rustc -g -C opt-level=0 test_programs/demo.rs -o target/test_bins/demo
 ```
 
-**Step 2: Launch the debugger**
-
+Launch and test:
 ```bash
 ./target/release/rdb target/test_bins/demo
-```
 
-**Step 3: Test breakpoints and stepping**
-
-```bash
-# Set breakpoint on calculate function
+# Basic workflow
 rdb> break set calculate
-
-# Start execution - should print "Starting calculation..." and stop
-rdb> cont
-
-# Step into the add function
-rdb> step
-
-# Step over the println
-rdb> next
-
-# Step over the addition
-rdb> next
-
-# Continue to finish
-rdb> cont
-```
-
-**Expected output:**
-```
-rdb> break set calculate
-Breakpoint 1 set on function calculate
-
-rdb> cont
-Starting calculation...
-Stopped at demo.rs:12
-
-rdb> step
-Stopped at demo.rs:2
-
-rdb> next
-Adding 3 and 4
-
-rdb> cont
-Multiplying 3 and 4
-Result: 19
-Done!
-Program exited
+rdb> cont                    # Stops at calculate function
+rdb> step                    # Steps into add function
+rdb> next                    # Steps over println
+rdb> cont                    # Continues to exit
 ```
 
 ### Test Scenarios
 
-#### Test 1: Function Breakpoints
-
+**Function breakpoints:**
 ```bash
-./target/release/rdb target/test_bins/demo
-
 rdb> break set add
 rdb> break set multiply
-rdb> break list        # Verify both breakpoints
-rdb> cont              # Stops at add
-rdb> cont              # Stops at multiply
-rdb> cont              # Program completes
+rdb> cont                    # Hits add
+rdb> cont                    # Hits multiply
 ```
 
-#### Test 2: Line Breakpoints
-
+**Line breakpoints:**
 ```bash
-./target/release/rdb target/test_bins/demo
-
 rdb> break set demo.rs:13
-rdb> cont              # Stops at line 13
-rdb> step              # Step to next line
-rdb> cont
+rdb> cont                    # Stops at line 13
 ```
 
-#### Test 3: Step Into/Over/Out
-
+**Step operations:**
 ```bash
-./target/release/rdb target/test_bins/demo
-
 rdb> break set main
 rdb> cont
-rdb> next              # Step over println (doesn't enter function)
-rdb> step              # Step into calculate
-rdb> step              # Step into add
-rdb> finish            # Step out of add back to calculate
-rdb> cont
+rdb> next                    # Step over (doesn't enter functions)
+rdb> step                    # Step into (enters functions)
+rdb> finish                  # Step out (returns from function)
 ```
 
-#### Test 4: Register and Memory Inspection
-
+**Inspection:**
 ```bash
-./target/release/rdb target/test_bins/demo
-
 rdb> break set calculate
 rdb> cont
-rdb> reg               # Show all registers
-rdb> mem $rsp          # Inspect stack pointer
-rdb> dis               # Disassemble current location
-rdb> cont
+rdb> reg                     # Show registers
+rdb> mem $rsp                # Show memory at stack pointer
+rdb> dis                     # Disassemble current location
 ```
-
-### Verify the Fix
-
-The main bug that was fixed: **Line table lookup was returning wrong source locations**
-
-**Before fix (BROKEN):**
-```
-Stopped at rt.rs:1  ❌ Wrong file!
-```
-
-**After fix (WORKING):**
-```
-Stopped at demo.rs:12  ✅ Correct!
-```
-
-When you debug, verify that:
-- File names show your source files (demo.rs), not runtime libraries (rt.rs)
-- Line numbers match your actual source code
-- Breakpoints stop at the correct functions
-- Stepping moves through your code accurately
 
 ## Testing
 
